@@ -13,6 +13,9 @@ let package = Package(
             name: "ikyo",
             dependencies: ["CGLFW"],
             path: "Source",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"]),
+            ],
             linkerSettings: [
                 .unsafeFlags(["-L\(Context.packageDirectory)/Libraries/GLFW/mac/arm64"], .when(platforms: [.macOS])),
                 .linkedLibrary("glfw3", .when(platforms: [.macOS])),
