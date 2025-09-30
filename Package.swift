@@ -23,6 +23,7 @@ let package = Package(
                 .linkedFramework("IOKit", .when(platforms: [.macOS])),
                 .linkedFramework("CoreVideo", .when(platforms: [.macOS])),
                 .linkedFramework("CoreFoundation", .when(platforms: [.macOS])),
+                .unsafeFlags(["-L\(Context.packageDirectory)/Libraries/GLFW/windows/x64"], .when(platforms: [.windows]))
             ]
         ),
     ]
