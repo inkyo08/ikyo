@@ -1,5 +1,5 @@
 class GameLoop {
-  var doFrame = true
+  var doFrame = false
 
   func initialize() {
 
