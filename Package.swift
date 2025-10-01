@@ -3,6 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "ikyo",
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-atomics", from: "1.3.0")
+    ],
     targets: [
         .systemLibrary(
             name: "CGLFW",
@@ -11,7 +14,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "ikyo",
-            dependencies: ["CGLFW"],
+            dependencies: [
+                "CGLFW",
+                .product(name: "Atomics", package: "swift-atomics")
+            ],
             path: "Source",
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"]),
