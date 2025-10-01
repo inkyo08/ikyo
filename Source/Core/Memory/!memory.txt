@@ -1,0 +1,532 @@
+Memory 시스템 완벽 문서화
+
+  개요
+
+  Ikyo 엔진의 커스텀 메모리 관리 시스템으로, 크로스 플랫폼(Windows, macOS, Linux) 지원과 성능 최적화를 목표로 구현됨.
+
+  ---
+  1. VirtualMemory.swift
+
+  구조체 & 열거형
+
+  VMRegion
+
+  가상 메모리 영역 표현
+  - base: UnsafeMutableRawPointer? - 메모리 베이스 주소
+  - size: Int - 영역 크기
+  - pageSize: Int - 페이지 크기
+  - reserved: Bool - 예약 상태
+
+  VMError: Error
+
+  - reserveFailed - 예약 실패
+  - commitFailed - 커밋 실패
+  - protectFailed - 보호 설정 실패
+  - releaseFailed - 해제 실패
+  - invalidParameters - 잘못된 파라미터
+
+  VMProtect
+
+  메모리 보호 수준
+  - noAccess - 접근 불가
+  - read - 읽기 전용
+  - readWrite - 읽기/쓰기 가능
+
+  VM 유틸리티 함수
+
+  VM.pageSize() -> Int (VirtualMemory.swift:39)
+
+  시스템 페이지 크기 반환
+  - Windows: GetSystemInfo() 사용
+  - Darwin: getpagesize() 사용
+  - Linux: sysconf(_SC_PAGESIZE) 사용, 실패 시 4096 기본값
+
+  VM.allocationGranularity() -> Int (VirtualMemory.swift:52)
+
+  할당 단위 반환
+  - Windows: dwAllocationGranularity 반환
+  - POSIX: 페이지 크기와 동일
+
+  VM.alignUp(_:to:) -> Int (VirtualMemory.swift:64)
+
+  값을 정렬 크기로 올림 정렬
+
+  VM.alignDown(_:to:) -> Int (VirtualMemory.swift:70)
+
+  값을 정렬 크기로 내림 정렬
+
+  메모리 관리 함수
+
+  vmReserve(size:alignment:) throws -> VMRegion (VirtualMemory.swift:80)
+
+  주소 공간 예약
+  - Windows: VirtualAlloc(MEM_RESERVE) 사용
+  - POSIX: mmap(PROT_NONE) 사용하여 over-reserve 후 정렬
+
+  vmCommit(_:offset:size:) throws -> Bool (VirtualMemory.swift:122)
+
+  예약된 영역의 일부를 커밋(물리 메모리 할당)
+  - Windows: VirtualAlloc(MEM_COMMIT, PAGE_READWRITE)
+  - POSIX: mprotect(PROT_READ|PROT_WRITE)
+
+  vmDecommit(_:offset:size:) (VirtualMemory.swift:146)
+
+  커밋된 영역을 디커밋(물리 메모리 해제)
+  - Windows: VirtualFree(MEM_DECOMMIT)
+  - POSIX: mprotect(PROT_NONE) + madvise(MADV_FREE/MADV_DONTNEED)
+
+  vmProtect(_:offset:size:prot:) throws -> Bool (VirtualMemory.swift:169)
+
+  메모리 보호 수준 변경
+  - Windows: VirtualProtect()
+  - POSIX: mprotect()
+
+  vmRelease(_:) throws (VirtualMemory.swift:202)
+
+  예약된 메모리 완전 해제
+  - Windows: VirtualFree(MEM_RELEASE)
+  - POSIX: munmap()
+
+  vmAdviseHuge(_:enable:) (VirtualMemory.swift:218)
+
+  Huge pages 힌트 제공 (best-effort)
+  - Windows: 런타임 변경 불가능 (MEM_LARGE_PAGES는 예약 시에만)
+  - macOS: 지원 안 함
+  - Linux: madvise(MADV_HUGEPAGE/MADV_NOHUGEPAGE)
+
+  ---
+  2. Arena.swift
+
+  MonotonicArena (Arena.swift:3)
+
+  단방향 범프 할당자 (monotonic bump allocator) - final class
+
+  프로퍼티
+
+  - region: VMRegion - 예약된 가상 메모리 영역
+  - committed: Int - 현재 커밋된 바이트 수
+  - offset: Int - 다음 할당 위치
+  - pageSize: Int - 페이지 크기
+
+  init?(reserveSize:) (Arena.swift:9)
+
+  - reserveSize: 예약할 총 크기
+  - 초기 커밋은 하지 않음 (lazy commit)
+
+  alloc(bytes:align:) -> UnsafeMutableRawPointer? (Arena.swift:20)
+
+  - 정렬된 위치에 메모리 할당
+  - 필요 시 자동 페이지 커밋
+  - 실패 시 nil 반환
+
+  reset() (Arena.swift:38)
+
+  - 모든 커밋된 페이지 디커밋
+  - offset과 committed를 0으로 재설정
+  - 예약은 유지
+
+  deinit (Arena.swift:45)
+
+  - 영역 해제
+
+  FrameArena (Arena.swift:51)
+
+  프레임 단위 할당자 (매 프레임마다 리셋) - final class
+
+  init?(reserveSize:) (Arena.swift:54)
+
+  내부적으로 MonotonicArena 생성
+
+  alloc(bytes:align:) -> UnsafeMutableRawPointer? (Arena.swift:59)
+
+  내부 arena에 위임
+
+  endFrame() (Arena.swift:63)
+
+  arena를 리셋하여 다음 프레임 준비
+
+  withFrameArena<T>(reserveSize:_:) -> T? (Arena.swift:69)
+
+  프레임 arena를 스코프 내에서 사용하는 헬퍼 함수
+  - 기본 예약 크기 64MB
+  - 블록 종료 시 자동으로 endFrame() 호출
+
+  ---
+  3. Allocator.swift
+
+  RawAllocator 프로토콜 (Allocator.swift:3)
+
+  기본 할당자 인터페이스
+
+  allocate(size:alignment:) -> UnsafeMutableRawPointer?
+
+  지정된 크기와 정렬로 메모리 할당
+
+  deallocate(_:size:)
+
+  메모리 해제
+
+  IkyoAlloc (Allocator.swift:8)
+
+  전역 할당자 진입점
+
+  global: RawAllocator (Allocator.swift:9)
+
+  - 기본값: BinnedAllocator.shared
+
+  EngineBuffer<Element> (Allocator.swift:14)
+
+  타입-세이프 메모리 버퍼
+
+  Swift 5.9+ 버전 (~Copyable)
+
+  init?(count:alignment:allocator:) (Allocator.swift:19)
+  - count: 요소 개수
+  - alignment: 정렬 (기본값: 타입의 자연 정렬)
+  - allocator: 사용할 할당자 (기본값: IkyoAlloc.global)
+
+  bufferPointer: UnsafeMutablePointer<Element> (Allocator.swift:28)
+  내부 포인터를 타입 포인터로 변환
+
+  subscript(i: Int) -> Element (Allocator.swift:32)
+  배열 스타일 인덱싱
+
+  deinit (Allocator.swift:37)
+  할당자를 통해 자동 해제
+
+  Swift 5.9 이전 버전 (class)
+
+  Non-copyable 대신 클래스로 구현, API는 동일
+
+  ---
+  4. ThreadLocalCache.swift
+
+  TLSMagazine (ThreadLocalCache.swift:17)
+
+  스레드 로컬 프리 리스트 캐시 - final class, @unchecked Sendable
+
+  내부 클래스
+
+  PerThread (ThreadLocalCache.swift:24)
+  스레드별 상태
+  - stacks: [[UnsafeMutableRawPointer]] - 클래스별 스택
+
+  프로퍼티
+
+  - maxClasses: Int - 최대 클래스 수
+  - stackCapacityPerClass: Int - 클래스당 스택 용량
+
+  shared: TLSMagazine (ThreadLocalCache.swift:18)
+
+  싱글톤 인스턴스
+
+  init(classes:cap:) (ThreadLocalCache.swift:47)
+
+  - 기본 80개 클래스, 32개 용량
+  - Windows: FLS 사용 (destructor 지원), 실패 시 TLS fallback
+  - POSIX: pthread_key_create() with destructor (스레드 종료 시 자동 플러시)
+
+  configure(maxClasses:cap:) (ThreadLocalCache.swift:89)
+
+  클래스 수와 용량 동적 증가 (축소는 안 함)
+
+  getThread() -> PerThread (ThreadLocalCache.swift:100)
+
+  현재 스레드의 PerThread 인스턴스 가져오기 (없으면 생성)
+  - Windows: FLS/TLS를 통해 스레드별 데이터 접근
+  - POSIX: pthread_getspecific/setspecific 사용
+
+  ensureCapacity(_:for:) (ThreadLocalCache.swift:129)
+
+  스레드별 스택 배열을 주어진 classIndex를 수용할 수 있도록 동적 확장
+  - OOB 방지를 위한 안전 장치
+
+  pop(classIndex:) -> UnsafeMutableRawPointer? (ThreadLocalCache.swift:143)
+
+  스레드 로컬 스택에서 포인터 꺼내기
+  - 비어있으면 nil 반환
+
+  push(classIndex:ptr:) -> [UnsafeMutableRawPointer]? (ThreadLocalCache.swift:156)
+
+  스레드 로컬 스택에 포인터 추가
+  - 오버플로우 시 절반을 배치로 반환
+
+  tryPopMany(classIndex:max:) -> [UnsafeMutableRawPointer] (ThreadLocalCache.swift:172)
+
+  배치 꺼내기 (리필용)
+
+  flushAllToGlobal(flusher:) (ThreadLocalCache.swift:185)
+
+  모든 스택을 글로벌 프리리스트로 플러시
+  - 프레임 경계나 메모리 압박 시 호출
+
+  flushAllToGlobal(of:flusher:) (ThreadLocalCache.swift:191)
+
+  임의의 PerThread 인스턴스를 플러시 (destructor 내부용)
+
+  Windows FLS Destructor (ThreadLocalCache.swift:204)
+
+  스레드 종료 시 자동 플러시 후 해제
+  - POSIX도 pthread_key_create의 destructor로 동일 구현 (ThreadLocalCache.swift:70)
+
+  ---
+  5. LargeAllocator.swift
+
+  LargeAllocator (LargeAllocator.swift:17)
+
+  대형 할당 전용 (4KB 초과) - final class, @unchecked Sendable
+
+  내부 구조체
+
+  Header (LargeAllocator.swift:28)
+  각 할당 직전에 저장되는 메타데이터
+  - base: UnsafeMutableRawPointer - 실제 베이스 주소
+  - totalSize: Int - 전체 예약 크기
+  - userSize: Int - 사용자 요청 크기
+  - guardPages: Int8 - 가드 페이지 수
+  - offsetFromBase: Int32 - 베이스로부터 오프셋
+  - magic: UInt64 - 검증용 매직 넘버 (0x1A2B3C4D5E6F7788)
+
+  프로퍼티
+
+  - shared: LargeAllocator (LargeAllocator.swift:18) - 싱글톤
+  - defaultGuardPagesEnabled: Bool (LargeAllocator.swift:21) - DEBUG에서 true
+
+  allocate(size:alignment:debugGuardPages:) -> UnsafeMutableRawPointer? (LargeAllocator.swift:40)
+
+  - 가드 페이지 추가 (DEBUG 기본 활성화)
+  - 정렬 요구사항 충족을 위해 over-allocate
+  - 헤더를 사용자 포인터 직전에 저장
+  - 가드 페이지를 PROT_NONE으로 보호
+
+  deallocate(_:size:) (LargeAllocator.swift:86)
+
+  - 헤더 읽어서 매직 검증
+  - 영역 디커밋 후 해제
+
+  maybeDeallocate(_:) -> Bool (LargeAllocator.swift:109)
+
+  - 헤더 매직 검사로 Large 할당 여부 판단
+  - Large 할당이면 해제 후 true 반환
+  - 아니면 false (페이지 경계 안전 검사 포함)
+
+  ---
+  6. BinnedAllocator.swift
+
+  BinnedAllocator: RawAllocator (BinnedAllocator.swift:19)
+
+  작은 객체(≤4KB) 할당자 - final class, @unchecked Sendable
+
+  상수
+
+  - maxSmallSize = 4096 (BinnedAllocator.swift:23)
+  - blockSizeDefault = 256KB (BinnedAllocator.swift:24)
+
+  v2 기능 플래그 (BinnedAllocator.swift:28)
+
+  - enableLUT: Bool = true - O(1) size→class 룩업 테이블
+  - enableExhaustedBackoff: Bool = true - 실패 시 exponential backoff
+  - enableBlockLists: Bool = false - 블록 리스트 추적 (기본 off)
+
+  프로퍼티
+
+  - shared: BinnedAllocator (BinnedAllocator.swift:20) - 싱글톤
+  - memoryPressureHandler: (() -> Void)? (BinnedAllocator.swift:34) - 메모리 압박 콜백
+  - classes: [Int] - 사이즈 클래스 테이블 (BinnedAllocator.swift:37)
+    - 16~256: 16 단위
+    - 288~512: 32 단위
+    - 576~4096: 64 단위
+  - sizeToClassLUT: [Int] - O(1) 룩업 배열 (BinnedAllocator.swift:41)
+  - binSizeToClassIndex: [Int: Int] - 역방향 맵 (BinnedAllocator.swift:44)
+
+  내부 클래스
+
+  ClassState (BinnedAllocator.swift:47)
+  각 사이즈 클래스별 상태
+  - binSize: Int - 빈 크기
+  - freeHead: ManagedAtomic<UInt> - 프리리스트 헤드 (lock-free stack)
+  - growLock: ManagedAtomic<Int> - 블록 성장용 스핀락
+  - freeCount: ManagedAtomic<Int> - 프리 빈 카운터
+  - v2 백오프 상태:
+    - exhausted: ManagedAtomic<Int> - 고갈 플래그
+    - backoffExp: ManagedAtomic<Int> - 백오프 지수
+    - nextGrowAfterNanos: ManagedAtomic<UInt64> - 다음 시도 시각
+  - v2 블록 리스트 (enableBlockLists일 때만):
+    - blocks: [Block] - 모든 블록
+    - partialBlocks/fullBlocks/emptyBlocks: [Int] - 인덱스 리스트
+
+  Block (BinnedAllocator.swift:70)
+  VM 블록 메타데이터
+  - region: VMRegion
+  - base: UnsafeMutableRawPointer
+  - size: Int
+  - binSize: Int
+  - binsTotal: Int
+  - binsFree: ManagedAtomic<Int>
+  - bitmapWords: [UInt64]? - 점유 비트맵 (enableBlockLists 시만)
+
+  초기화 (BinnedAllocator.swift:86)
+
+  - 사이즈 클래스 테이블 구축
+  - LUT 빌드 (buildLUT() 호출)
+  - 역방향 맵 생성
+  - TLSMagazine 용량 설정
+
+  핵심 함수
+
+  buildLUT(classes:) -> [Int] (BinnedAllocator.swift:116)
+  O(1) 크기→클래스 인덱스 LUT 생성
+
+  classIndex(for:) -> Int? (BinnedAllocator.swift:136)
+  크기를 사이즈 클래스 인덱스로 변환
+  - LUT 활성화 시 O(1)
+  - 비활성화 시 선형 스캔
+
+  spinLock(_:) / spinUnlock(_:) (BinnedAllocator.swift:151, 165)
+  스핀락 구현
+
+  pushFree(_:_:) (BinnedAllocator.swift:170)
+  글로벌 프리리스트에 포인터 추가 (lock-free CAS 루프)
+
+  popFree(_:) -> UnsafeMutableRawPointer? (BinnedAllocator.swift:190)
+  글로벌 프리리스트에서 꺼내기 (lock-free)
+
+  storeNext(_:next:) (BinnedAllocator.swift:207)
+  프리리스트 노드에 다음 포인터 저장 (intrusive linked list)
+
+  loadNext(_:) -> UnsafeMutableRawPointer? (BinnedAllocator.swift:214)
+  프리리스트 노드에서 다음 포인터 로드
+
+  v2 백오프 헬퍼:
+  - nowNanos() -> UInt64 (BinnedAllocator.swift:223) - 단조 시간
+  - backoffDelayNanos(exp:) -> UInt64 (BinnedAllocator.swift:239) - 지수 지연 계산 (1ms~50ms)
+  - shouldAttemptGrow(_:) -> Bool (BinnedAllocator.swift:247) - 백오프 게이트
+  - recordGrowFailure(_:) (BinnedAllocator.swift:255) - 실패 기록 및 백오프 설정
+  - recordGrowSuccess(_:) (BinnedAllocator.swift:269) - 성공 시 백오프 리셋
+
+  v2 블록 리스트 헬퍼 (enableBlockLists 시만):
+  - initBlockMetadataIfEnabled(_:in:) (BinnedAllocator.swift:278) - 비트맵 초기화
+  - markAllocatedIfEnabled(_:ptr:) (BinnedAllocator.swift:288) - 할당 마킹
+  - markFreedIfEnabled(_:ptr:) (BinnedAllocator.swift:313) - 해제 마킹
+  - findBlockAndBinIndex(_:ptr:) (BinnedAllocator.swift:335) - 포인터→블록/빈 인덱스
+  - updateListsOnAlloc/Free (BinnedAllocator.swift:351, 366) - 리스트 상태 업데이트
+  - remove(_:_:) (BinnedAllocator.swift:386) - 배열에서 값 제거 (블록 리스트 관리용)
+
+  grow(_:) -> Bool (BinnedAllocator.swift:391)
+  새 VM 블록 커밋 및 프리리스트에 빈 추가
+  - 블록 크기: max(256KB, binSize*64)
+  - 실패 시 백오프 기록
+
+  allocate(size:alignment:) -> UnsafeMutableRawPointer? (BinnedAllocator.swift:442)
+  1. 정렬 요구사항이 빈 정렬보다 크면 LargeAllocator로 라우팅
+  2. TLS 캐시에서 시도 (TLSMagazine.pop)
+  3. 글로벌 프리리스트에서 시도 (popFree)
+  4. 백오프 게이트 통과 시 grow() 호출
+  5. 모두 실패 시 nil
+
+  deallocate(_:size:) (BinnedAllocator.swift:489)
+  1. LargeAllocator.maybeDeallocate() 먼저 체크
+  2. 작은 할당이면:
+    - DEBUG: quarantine 시도, double-free 체크, poison
+    - TLS 캐시에 푸시, 오버플로우 시 글로벌로 플러시
+
+  flushTLS() (BinnedAllocator.swift:523)
+  모든 TLS 캐시를 글로벌로 플러시 (프레임 경계 등)
+
+  tlsFlushHook(_:_:) (BinnedAllocator.swift:535)
+  TLS destructor용 내부 훅
+
+  freeFromQuarantine(_:binSize:) (BinnedAllocator.swift:546)
+  quarantine에서 직접 해제 (재귀 방지)
+
+  ---
+  7. MemoryDebug.swift
+
+  MemoryDebug enum (MemoryDebug.swift:7)
+
+  DEBUG 빌드 전용 디버깅 레이어
+
+  내부 상수 (DEBUG만)
+
+  - canary1 = 0xFE (MemoryDebug.swift:9)
+  - canary2 = 0xDD (MemoryDebug.swift:10)
+  - doubleFreeMagic = 0xDEADBEEFDEADBEEF (MemoryDebug.swift:11)
+  - quarantineCapacity = 256 (MemoryDebug.swift:14)
+
+  내부 클래스
+
+  State (MemoryDebug.swift:17)
+  디버그 상태 (Sendable)
+  - quarantine: [(ptr, classSize)] - quarantine 큐
+  - quarantineLock: NSLock
+  - liveSet: Set<UInt> - 현재 해제된 포인터 집합 (double-free 감지용)
+  - liveLock: NSLock
+  - leakMap: [UInt: (size, file, line, function)] - 누수 추적
+  - leakLock: NSLock
+
+  프로파일링 카운터 (MemoryDebug.swift:29)
+
+  - allocCount: ManagedAtomic<Int>
+  - freeCount: ManagedAtomic<Int>
+  - commitCount: ManagedAtomic<Int>
+  - decommitCount: ManagedAtomic<Int>
+
+  함수
+
+  poison(ptr:size:) (MemoryDebug.swift:36)
+  메모리를 canary1(0xFE)로 채움 (DEBUG만)
+
+  checkCanaryOnAlloc(ptr:size:) (MemoryDebug.swift:42)
+  할당 시 canary2(UAF 감지) 체크, liveSet에서 제거, allocCount 증가
+
+  quarantinePush(ptr:classSize:) -> Bool (MemoryDebug.swift:62)
+  - quarantine 큐에 추가
+  - 용량 초과 시 가장 오래된 것을 freeFromQuarantine()로 해제
+  - true 반환 시 호출자는 해제 건너뜀
+
+  checkDoubleFree(ptr:) (MemoryDebug.swift:86)
+  liveSet에 중복 삽입 시 assertion 발생
+
+  tagAlloc(ptr:size:file:line:function:) (MemoryDebug.swift:98)
+  할당 위치를 leakMap에 기록
+
+  tagFree(ptr:) (MemoryDebug.swift:108)
+  leakMap에서 제거, freeCount 증가
+
+  dumpLeaks() (MemoryDebug.swift:119)
+  leakMap에 남아있는 항목 출력 (누수 감지)
+
+  ---
+  전체 아키텍처 요약
+
+  계층 구조
+
+  IkyoAlloc.global
+      ↓
+  BinnedAllocator (≤4KB)
+      ├─ TLSMagazine (thread-local cache)
+      ├─ ClassState (per size-class freelist + v2 features)
+      └─ LargeAllocator (>4KB or high alignment)
+          └─ VirtualMemory (vmReserve/Commit/Decommit/Release)
+
+  MonotonicArena / FrameArena (별도 범프 할당자)
+      └─ VirtualMemory
+
+  MemoryDebug (DEBUG 전용)
+      ├─ Canary / Double-free / UAF 감지
+      ├─ Quarantine (delayed free)
+      └─ Leak tracking
+
+  주요 특징
+
+  1. 크로스 플랫폼: Windows(VirtualAlloc/FLS), macOS/Linux(mmap/pthread_key)
+  2. 계층별 최적화:
+    - 작은 할당: lock-free freelist + TLS 캐시
+    - 큰 할당: 직접 VM 예약/커밋 + 가드 페이지
+  3. v2 기능 (플래그 제어):
+    - O(1) 사이즈→클래스 LUT
+    - Exponential backoff on exhaustion
+    - 블록 점유 비트맵 (기본 off)
+  4. DEBUG 도구: canary, quarantine, double-free/UAF 감지, 누수 추적
+
+  모든 할당자는 RawAllocator 프로토콜을 구현하며, EngineBuffer<T>로 타입-세이프 래퍼 제공.
