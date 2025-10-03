@@ -1,0 +1,4 @@
+엔진 이벤트 시스템 구조
+
+GlobalEventSystem - GlobalEventSystem은 **엔진 전역 수준의 시스템 이벤트**를 관리합니다
+EntityEventSystem - EntityEventSystem은 **엔티티별 이벤트**를 관리합니다
