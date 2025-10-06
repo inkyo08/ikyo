@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ikyo",
+    platforms: [.macOS(.v12)],
     dependencies: [
         .package(url: "https://github.com/apple/swift-atomics", from: "1.3.0")
     ],
