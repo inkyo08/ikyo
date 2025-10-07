@@ -1,0 +1,421 @@
+     1→이 Ikyo 게임 엔진 코드베이스를 기반으로 기존 구조와 철학에 맞는 고성능 ECS(Entity Component System) 아키텍처를 설계하세요.
+     2→
+     3→요구사항:
+     4→
+     5→모놀리식 아키텍처 철학을 따를 것 (플러그인 없이 통합됨)
+     6→기존 커스텀 메모리 할당자 사용 (BinnedAllocator, LargeAllocator, Arena)
+     7→레이 마칭 렌더링 워크로드에 최적화
+     8→최대 성능 - Swift의 제네릭 활용 및 핫 패스에서 프로토콜 existential 회피
+     9→DOD(Data-Oriented Design) 원칙 설계
+    10→이것이 완전한 레이 마칭 렌더러임을 고려 (전통적인 래스터화 방식 아님)
+    11→
+    12→제공해야 할 내용:
+    13→
+    14→완전한 ECS 아키텍처 설계 (sparse-set vs archetype 권장사항)
+    15→구체적인 코드 구조 및 파일 구성
+    16→기존 메모리 시스템과의 통합 지점
+    17→레이 마칭 워크로드를 위한 컴포넌트, 시스템, 쿼리 구조화 방법
+    18→이 코드베이스에 특화된 성능 중요 고려사항
+    19→
+    20→
+    21→
+    22→----
+    23→
+    24→다음은 모놀리식을 유지하고, 할당자를 직접 사용하며, 레이 마칭 렌더러와 Swift 성능 특성에 맞게 조정된 Ikyo를 위한 구체적인 ECS 설계입니다. SoA 레이아웃, 제네릭 전용 API를 우선시하고 핫 패스에서 ARC와 프로토콜 existential을 회피합니다.
+    25→
+    26→아키텍처: 캐시된 뷰(SoA)가 있는 하이브리드 sparse-set, archetype 방식 아님
+    27→
+    28→근거:
+    29→
+    30→레이 마칭은 알려진 소규모 컴포넌트 세트(Transform + SDF primitive 계열 + Material [+ 태그])를 순회합니다. 일반적으로 쿼리되는 컴포넌트 조합의 세트는 고정되어 있고 작습니다.
+    31→Sparse-set 스토리지는 O(1) 추가/제거, 안정적인 연속 반복 순서를 제공하며, 구성 변경 시 대규모 행 이동이 없습니다(archetype과 달리).
+    32→컴포넌트당 캐시 친화적인 dense 배열(SoA)을 유지합니다. 쿼리는 dense 배열을 한 번 교차하고 매 프레임마다 결과를 스트리밍합니다.
+    33→핫 조합(예: Renderable + Transform + Sphere)을 위한 미리 계산된 "뷰"(캐시된 교차점)를 추가하여 프레임당 반복되는 집합 교차를 제거합니다. 이러한 "뷰"는 추가/제거 시 점진적으로 또는 FrameArena를 사용하여 프레임당 지연 방식으로 재구축됩니다.
+    34→Archetype은 여기서는 과도하며 단편화, 높은 변경 비용, 모놀리식 고정 시스템 렌더러에 이점이 없는 복잡성을 도입합니다.
+    35→
+    36→핵심 설계:
+    37→
+    38→Entity = 32비트 packed ID (index: 24비트, generation: 8비트) 또는 원하는 경우 20/12. Generation은 ABA 재사용을 방지합니다. 재사용을 위한 Free-list.
+    39→ComponentStorage: packed sparse-set:
+    40→
+    41→denseEntities: EngineBuffer<Entity>
+    42→dense: EngineBuffer<T> (64바이트 정렬)
+    43→sparse: 페이지 또는 플랫 EngineBuffer<Int32> entityIndex -> denseIndex 매핑 (또는 -1)
+    44→LargeAllocator를 사용한 수동 증가와 함께 size/capacity (EngineBuffer를 통해).
+    45→핫 패스를 위한 Add/Remove/Has/Get Unsafe 포인터 API, existential/프로토콜 메커니즘 없음.
+    46→
+    47→쿼리 뷰:
+    48→
+    49→특정 조합에 대해 미리 계산된 dense 인덱스 목록을 보유하고, dirty로 표시되면 재구축되는 소규모 고정 구조체.
+    50→원하는 경우 빠른 점진적 무효화를 위한 뷰 멤버십 bitset/태그 bloom 저장 (선택 사항).
+    51→
+    52→시스템은 스토리지에 대해 매개변수화된 일반 함수입니다. 프로토콜 System 없음. 핫 루프를 monomorphic하게 유지합니다.
+    53→
+    54→구체적인 코드 구조 및 파일 구성
+    55→
+    56→ecs/Entity.swift
+    57→
+    58→Entity (UInt32 id), generation, freelist, 용량 관리가 있는 EntityManager.
+    59→
+    60→ecs/storage/PackedSparseSet.swift
+    61→
+    62→struct PackedSparseSet<T> { … } EngineBuffer<T>, EngineBuffer<Entity>, EngineBuffer<Int32> 사용
+    63→인라인 add/remove/has/get/forEach
+    64→
+    65→ecs/storage/PackedSparseSet.swift
+    66→
+    67→struct PackedSparseSet<T> { … } EngineBuffer<T>, EngineBuffer<Entity>, EngineBuffer<Int32> 사용
+    68→인라인 add/remove/has/get/forEach
+    69→
+    70→ecs/World.swift
+    71→
+    72→final class World { entities, 그리고 구체적인 스토리지:
+    73→
+    74→transforms: PackedSparseSet<Transform>
+    75→materials: PackedSparseSet<Material>
+    76→renderable: PackedSparseSet<TagRenderable> (tag = Empty struct)
+    77→sdfSphere: PackedSparseSet<SDFSphere>
+    78→sdfBox: PackedSparseSet<SDFBox>
+    79→sdfCapsule: PackedSparseSet<SDFCapsule>
+    80→선택 사항: CSG 레벨 작성을 수행하는 경우 sdfUnion/sdfDifference 노드 (하지만 아래 참고 사항 참조).
+    81→캐시된 뷰 (구조체), dirty 플래그
+    82→프레임당 frameArena: FrameArena
+    83→}
+    84→
+    85→ecs/Query.swift
+    86→
+    87→(Renderable + Transform + SDFSphere) 등에 대한 뷰를 구축하는 함수; FrameArena를 사용하여 dense 인덱스 배열 반환.
+    88→
+    89→ecs/Systems/*
+    90→
+    91→Spawn/Destroy/Attach 컴포넌트
+    92→Transform 전파 (계층 구조가 있는 경우, 그렇지 않으면 transform을 로컬로 유지)
+    93→BuildRayMarchSceneSystem (ECS를 레이 마처용 packed scene으로 컴파일)
+    94→
+    95→render/raymarch/RayMarchScene.swift
+    96→
+    97→struct RayMarchScene { 타입별 배열 및 선택적 공간 bin; FrameArena에서 프레임당 할당됨 }
+    98→
+    99→render/raymarch/RayMarchSystems.swift
+   100→
+   101→BuildRayMarchScene(world: World) -> RayMarchScene
+   102→RayMarchRender(world: World, scene: RayMarchScene, …)
+   103→
+   104→메모리 통합은 Allocator.swift, BinnedAllocator.swift, LargeAllocator.swift, Arena.swift에 이미 제공됨
+   105→
+   106→기존 메모리 시스템과의 통합
+   107→
+   108→영구 스토리지:
+   109→
+   110→dense 배열에 내부적으로 EngineBuffer 사용. EngineBuffer는 이미 작은 것은 BinnedAllocator로, >4KB는 LargeAllocator로 라우팅합니다. SoA 버퍼의 캐시 라인 정렬을 위해 alignment = max(64, MemoryLayout<T>.alignment) 지정.
+   111→PackedSparseSet의 메타데이터(개수, 용량, < 4KB의 간단한 배열)는 자연스럽게 BinnedAllocator를 통과합니다.
+   112→
+   113→프레임 임시 데이터:
+   114→
+   115→다음을 위해 FrameArena 사용:
+   116→
+   117→쿼리 교차점 및 임시 목록
+   118→프레임당 RayMarchScene 빌드 산출물 (SoA 배열, 그리드)
+   119→
+   120→world.endFrame():
+   121→
+   122→BinnedAllocator.shared.flushTLS()
+   123→frameArena.endFrame()
+   124→
+   125→대규모 CPU 작업 세트 (scene 배열) 및 scene 컴파일:
+   126→
+   127→FrameArena에서 대규모 프레임당 배열을 할당하여 저렴하게 재설정; 핫 패스에서 ARC 컨테이너 회피.
+   128→
+   129→레이 마칭에 맞춰진 컴포넌트, 시스템 및 쿼리
+   130→컴포넌트 (POD 전용; ARC 멤버 없음):
+   131→
+   132→Transform: position (Float3), rotation (Quaternion32 또는 3x3), scale (Float3). 크기 ~48–64B.
+   133→Material: baseColor (Float3 또는 packed), emission (Float3), roughness/metalness (packed UInt32 또는 floats).
+   134→TagRenderable: Empty struct (tag).
+   135→BoundsSphere: Float4 (center.xyz, radius) 거친 컬링 및 보수적 SDF 경계용.
+   136→엔티티당 원시 SDF 컴포넌트 (엔티티당 하나):
+   137→
+   138→SDFSphere { radius: Float }
+   139→SDFBox { halfExtents: Float3; round: Float }
+   140→필요한 경우 SDFCapsule { a: Float3, b: Float3, radius: Float }
+   141→선택 사항: SDFSmoothUnion { k: Float }과 같은 SDFOpModifier 컴포넌트는 RayMarchScene으로 컴파일하는 것이 좋습니다(아래 참조).
+   142→지침: 다형성 회피. 각 원시 타입은 자체 컴포넌트 스토리지(SoA)를 가집니다. 시스템은 타입별 루프를 수행합니다.
+   143→
+   144→시스템:
+   145→
+   146→TransformSystem (선택적 계층): 부모가 있는 경우 world transform을 미리 계산. 핫 루프를 단순하게 유지하기 위해 최종 transform만 Transform에 저장.
+   147→BoundsSystem: Transform + primitive 매개변수에서 BoundsSphere 계산/업데이트 (SoA, strided).
+   148→BuildRayMarchSceneSystem:
+   149→
+   150→입력: world 스토리지: TagRenderable + Transform + SDF 타입 중 하나 (+ Material, + BoundsSphere)
+   151→출력: 타입별 SoA 배열이 있는 RayMarchScene. 할당에 FrameArena 사용.
+   152→선택 사항: 타일/영역당 원시 항목을 컬링하기 위한 간단한 균일 공간 그리드 또는 셀 목록 구축. 이는 SDF에도 유용합니다: SDF는 전역 함수이지만 거리 경계 컬링은 레이당 후보 세트를 대폭 줄입니다.
+   153→
+   154→RayMarchRenderSystem:
+   155→
+   156→RayMarchScene 가져오기; 각 레이 디스패치에 대해 공간 bin을 참조하여 압축 후보 목록 가져오기; 타입별 특수 루프로 원시 타입당 SDF 거리를 마치하고 평가 (동적 디스패치 또는 existential 프로토콜 없음).
+   157→
+   158→쿼리:
+   159→
+   160→일반적인 교차점에 캐시된 "뷰" 사용. 예: Renderable + Transform + SDFSphere (+ Material?).
+   161→
+   162→각 스토리지에는 denseEntities 배열이 있습니다. 가장 작은 dense 세트(예: sdfSphere)를 선택하고 sparse 인덱스를 통해 다른 세트의 멤버십을 확인하여 교차점을 구축합니다.
+   163→이러한 엔티티 목록(EngineBuffer<Entity>) 또는 dense 인덱스만(EngineBuffer<Int32>)을 World에 캐시하여 동일한 프레임에서 재사용합니다. 관련 스토리지에서 add/remove 시 dirty로 표시합니다.
+   164→
+   165→
+   166→Ikyo + Swift + 레이 마칭에 특화된 성능 중요 고려사항
+   167→
+   168→ARC 및 existential 회피:
+   169→
+   170→모든 컴포넌트는 POD 구조체입니다. 핫 루프에서 캡처된 클래스 참조나 클로저가 없습니다.
+   171→핫 패스에 프로토콜 Component 또는 System 없음. 구체적 타입에 제네릭 함수 사용.
+   172→
+   173→Monomorphic 핫 루프 선호:
+   174→
+   175→마칭을 위한 원시 타입별 별도 루프; 루프 내부에 요소별 switch 없음.
+   176→특수화를 위한 타이트 루프 및 접근자에 @inlinable 및 @inline(__always).
+   177→
+   178→SoA 및 정렬:
+   179→
+   180→dense 배열에 alignment >= 64인 EngineBuffer 사용.
+   181→transform/material의 경우 컴포넌트 자체가 AoS 레코드입니다; 함께 액세스하는 경우 괜찮습니다. 개별 필드를 독립적으로 액세스하는 경우 별도의 SoA 스토리지로 분할합니다(예: Position3, RotationQ, Scale3). AoS Transform으로 시작하고 프로파일링이 요구하는 경우에만 분할합니다.
+   182→
+   183→Bounds 우선:
+   184→
+   185→각 인스턴스에 대해 BoundsSphere 유지; 마칭 중 경계를 테스트하여 레이당 후보 세트를 조기에 생성합니다.
+   186→화면 타일 또는 world space 그리드로 키가 지정된 프레임당 매우 가벼운 공간 bin 구축 (FrameArena); 인스턴스 인덱스 목록 저장.
+   187→
+   188→메모리/도구 통합:
+   189→
+   190→프레임 종료: FrameArena.reset + BinnedAllocator.flushTLS
+   191→EngineBuffer 정리 할당 해제는 정확한 크기로 할당자를 통과합니다.
+   192→매우 큰 읽기 전용 배열(예: scene 컴파일 결과)의 경우 Linux에서 지원되는 경우 TLB 미스를 줄이기 위해 vmAdviseHuge(region, enable: true) 고려; scene 데이터에 대한 영구 arena를 유지하는 경우 FrameArena 커밋 후 한 번 호출 (선택 사항).
+   193→
+   194→Swift 마이크로 최적화:
+   195→
+   196→루프에서 경계 검사를 제거하려면 withUnsafeMutableBufferPointer 액세스.
+   197→정말 핫한 경우 for-in 대신 포인터 범핑이 있는 while 루프 선호.
+   198→타이트 루프에서 클로저 캡처 회피; 수동 루프 함수 제공.
+   199→크로스 파일 인라이닝을 위해 스토리지 및 world final 및 internal 함수를 @inlinable로 표시 (모놀리식이므로).
+   200→
+   201→스레딩:
+   202→
+   203→원시 타입별로 스레드 간 빌드 분할, 각 스레드는 자체 FrameArena 서브 할당에 작성 (또는 출력 배열을 미리 슬라이스). 이후 범위 연결.
+   204→분할 없이 스레드 간에 EngineBuffer를 가변적으로 공유하지 않도록 주의. 타일당 레이 마칭은 사소하게 병렬 가능.
+   205→
+   206→주요 구조체 및 API (간결한 스케치)
+   207→
+   208→ecs/Entity.swift
+   209→struct Entity { var raw: UInt32 } // 24비트 인덱스, 8비트 gen
+   210→@inline(__always) func entityIndex(_ e: Entity) -> Int { Int(e.raw & 0x00FF_FFFF) }
+   211→@inline(__always) func entityGen(_ e: Entity) -> UInt8 { UInt8((e.raw >> 24) & 0xFF) }
+   212→
+   213→final class EntityManager {
+   214→private var generations: EngineBuffer<UInt8>
+   215→private var freeList: [UInt32] = []
+   216→private(set) var capacity: Int
+   217→init(initial: Int = 8192) { ... EngineBuffer를 통해 generation 할당 ... }
+   218→func create() -> Entity { ... }
+   219→func destroy(_ e: Entity) { ... gen 증가, freeList에 인덱스 푸시 ... }
+   220→@inline(__always) func alive(_ e: Entity) -> Bool { generations[eIndex] == eGen }
+   221→}
+   222→
+   223→ecs/storage/PackedSparseSet.swift
+   224→struct PackedSparseSet<T> {
+   225→// SoA: dense 값 및 dense->entity 매핑
+   226→private var values: EngineBuffer<T>
+   227→private var entities: EngineBuffer<Entity>
+   228→// sparse는 entityIndex -> denseIndex+1 매핑 (0은 비어 있음을 의미), 배열을 작고 branchless하게 유지
+   229→private var sparse: EngineBuffer<Int32>
+   230→private(set) var count: Int
+   231→private var capacity: Int
+   232→
+   233→init(initialCapacity: Int = 1024, align: Int = 64) { ... values = EngineBuffer<T>(count: initialCapacity, alignment: align) ... }
+   234→mutating func ensureCapacity(_ n: Int) { ... EngineBuffer를 통해 LargeAllocator를 사용하여 세 개의 버퍼(values/entities/sparse) 모두 증가 ... }
+   235→@inline(__always) func has(_ e: Entity) -> Bool { let i = entityIndex(e); return i < sparse.count && sparse[i] != 0 }
+   236→@inline(__always) mutating func add(_ e: Entity, _ v: T) { ... dense로 push back; sparse[entityIndex]=denseIndex+1 업데이트 }
+   237→@inline(__always) mutating func remove(_ e: Entity) { ... dense에서 swap-remove; sparse 업데이트; entities[] 유지 }
+   238→@inline(__always) func getPtr(_ e: Entity) -> UnsafeMutablePointer<T>? { ... return &values.bufferPointer[denseIndex] }
+   239→@inline(__always) func forEach(_ body: (UnsafeMutablePointer<T>, Entity) -> Void) { // monomorphic 루프
+   240→let vp = values.bufferPointer
+   241→let ep = entities.bufferPointer
+   242→var i = 0
+   243→while i < count {
+   244→body(vp.advanced(by: i), ep.advanced(by: i).pointee)
+   245→
+   246→i &+= 1
+   247→}
+   248→}
+   249→}
+   250→
+   251→ecs/World.swift
+   252→struct Transform { var pos: SIMD3<Float>; var rot: simd_quatf; var scl: SIMD3<Float> }
+   253→struct Material { var base: SIMD3<Float>; var emissive: SIMD3<Float>; var packed: UInt32 }
+   254→struct TagRenderable {}
+   255→struct BoundsSphere { var center: SIMD3<Float>; var radius: Float }
+   256→struct SDFSphere { var radius: Float }
+   257→struct SDFBox { var halfExtents: SIMD3<Float>; var round: Float }
+   258→// 필요에 따라 더 추가
+   259→
+   260→struct RMViewSphere { var indices: EngineBuffer<Int32> } // sdfSphere 스토리지의 dense 인덱스; arena에서 프레임당 구축됨
+   261→// 마찬가지로 RMViewBox 등.
+   262→
+   263→final class World {
+   264→let entities = EntityManager(initial: 65536)
+   265→var transforms = PackedSparseSet<Transform>()
+   266→var materials = PackedSparseSet<Material>()
+   267→var renderable = PackedSparseSet<TagRenderable>()
+   268→var bounds = PackedSparseSet<BoundsSphere>()
+   269→var sdfSphere = PackedSparseSet<SDFSphere>()
+   270→var sdfBox = PackedSparseSet<SDFBox>()
+   271→// 캐시된 뷰 (FrameArena로 프레임당 재생성됨)
+   272→var viewSphereCountDirty = true
+   273→// 프레임당 arena
+   274→private let frameArena = FrameArena(reserveSize: 64 * 1024 * 1024)!
+   275→
+   276→func beginFrame() { /* 구조적 변경을 지연 방식으로 추적하는 경우 뷰를 dirty로 표시 */ }
+   277→func endFrame() {
+   278→BinnedAllocator.shared.flushTLS()
+   279→frameArena.endFrame()
+   280→}
+   281→func arena() -> FrameArena { frameArena }
+   282→}
+   283→
+   284→ecs/Query.swift
+   285→@inline(__always)
+   286→func buildRenderableSphereView(world: World, arena: FrameArena) -> RMViewSphere {
+   287→let srcCount = world.sdfSphere.count
+   288→let out = EngineBuffer<Int32>(count: srcCount, alignment: 64, allocator: IkyoAlloc.global)!
+   289→let outPtr = out.bufferPointer
+   290→let entPtr = world.sdfSphere.entities.bufferPointer
+   291→var outCount = 0
+   292→var i = 0
+   293→while i < srcCount {
+   294→let e = entPtr.advanced(by: i).pointee
+   295→if world.renderable.has(e) && world.transforms.has(e) {
+   296→outPtr.advanced(by: outCount).pointee = Int32(i)
+   297→outCount &+= 1
+   298→}
+   299→i &+= 1
+   300→}
+   301→// 필요한 경우 축소 (선택 사항) 또는 별도로 count 저장
+   302→return RMViewSphere(indices: out /* 원하는 경우 별도로 count 유지 */)
+   303→}
+   304→
+   305→render/raymarch/RayMarchScene.swift
+   306→struct RayMarchScene {
+   307→// 타입별 인스턴스 데이터의 SoA 사전 변환 (필요한 경우):
+   308→var sphereCenter: UnsafeMutablePointer<SIMD3<Float>>
+   309→var sphereRadius: UnsafeMutablePointer<Float>
+   310→var sphereMaterial: UnsafeMutablePointer<UInt32>
+   311→var sphereCount: Int
+   312→// box 등에 대해서도 동일
+   313→// 프레임당 구축되는 선택적 공간 bin:
+   314→var gridCellOffsets: UnsafeMutablePointer<Int32>?
+   315→var gridIndices: UnsafeMutablePointer<Int32>?
+   316→var gridCellCount: Int
+   317→}
+   318→
+   319→render/raymarch/RayMarchSystems.swift
+   320→func buildRayMarchScene(world: World) -> RayMarchScene {
+   321→let arena = world.arena()
+   322→// sphere 뷰 구축
+   323→let view = buildRenderableSphereView(world: world, arena: arena)
+   324→
+   325→// sphere용 SoA 할당
+   326→let n = world.sdfSphere.count // 또는 뷰 count
+   327→let centers = arena.alloc(bytes: n * MemoryLayout<SIMD3<Float>>.stride, align: 64)!.bindMemory(to: SIMD3<Float>.self, capacity: n)
+   328→let radii = arena.alloc(bytes: n * MemoryLayout<Float>.stride, align: 64)!.bindMemory(to: Float.self, capacity: n)
+   329→let mats = arena.alloc(bytes: n * MemoryLayout<UInt32>.stride, align: 64)!.bindMemory(to: UInt32.self, capacity: n)
+   330→
+   331→// 뷰의 dense 인덱스를 사용하여 스토리지에서 채우기 (해시 조회 없음)
+   332→let sphereVals = world.sdfSphere.values.bufferPointer
+   333→let entPtr = world.sdfSphere.entities.bufferPointer
+   334→let trVals = world.transforms.values.bufferPointer
+   335→let matVals = world.materials.values.bufferPointer
+   336→var i = 0
+   337→while i < n {
+   338→let di = Int(view.indices.bufferPointer.advanced(by: i).pointee)
+   339→let e = entPtr.advanced(by: di).pointee
+   340→let t = trVals.advanced(by: world.transforms.sparse.bufferPointer[entityIndex(e)] - 1).pointee // 또는 co-pack하는 경우 동일한 dense 인덱스에 transform 저장; 가장 간단한 것은 getPtr(e)!
+   341→let s = sphereVals.advanced(by: di).pointee
+   342→centers[i] = t.pos // 또는 transform에서 계산된 center
+   343→radii[i] = s.radius * maxComponent(t.scl)
+   344→// material은 선택 사항; 누락된 경우 기본값 작성
+   345→var mp: UInt32 = 0
+   346→if let mpPtr = world.materials.getPtr(e) { mp = mpPtr.pointee.packed }
+   347→mats[i] = mp
+   348→i &+= 1
+   349→}
+   350→
+   351→// 거친 컬링을 위해 선택적으로 arena에 간단한 균일 그리드 구축
+   352→// RayMarchScene 채우고 반환
+   353→return RayMarchScene(
+   354→sphereCenter: centers,
+   355→sphereRadius: radii,
+   356→sphereMaterial: mats,
+   357→sphereCount: n,
+   358→gridCellOffsets: nil,
+   359→gridIndices: nil,
+   360→gridCellCount: 0
+   361→)
+   362→}
+   363→func rayMarchRender(world: World, scene: RayMarchScene) {
+   364→// scene.sphere* 배열을 순회하는 원시 타입별 특수 렌더 루프
+   365→// monomorphic을 유지하기 위해 원시 타입별 별도 함수 선호
+   366→}
+   367→
+   368→레이 마칭 경로의 성능 참고 사항
+   369→
+   370→원시 타입별로 그룹화하고 타입별 특수 마칭 커널 실행. 이는 런타임 스위칭을 방지하고 브랜치 예측을 개선합니다.
+   371→레이당 후보 목록을 작게 유지:
+   372→
+   373→BoundsSphere와 프레임당 구축된 간단한 그리드를 사용하여 픽셀 타일 또는 레이 패킷당 후보를 미리 선택. 거친 32^3 그리드조차도 큰 이득을 제공합니다.
+   374→
+   375→Transform 최소한으로 평가:
+   376→
+   377→컴파일 시간에 center/radius/box extent를 scene 배열에 구워 넣거나 (선호), transform을 별도로 유지하되 연속적이고 프리페치합니다.
+   378→
+   379→데이터를 핫하고 패킹된 상태로 유지:
+   380→
+   381→Material 데이터를 촘촘하게 패킹 (예: packed RGBA16F 또는 10비트 형식을 UInt32로) 하여 마칭 루프의 대역폭 감소.
+   382→
+   383→모든 임시 배열 및 후보 목록에 FrameArena 사용; ARC 없음, retain/release 없음.
+   384→다음에 @inlinable 및 @inline(__always) 배치:
+   385→
+   386→PackedSparseSet.getPtr/add/remove/has
+   387→쿼리 빌더
+   388→각 원시 타입에 대한 거리 평가자
+   389→
+   390→CSG 및 SDF 그래프 작성에 대한 참고 사항
+   391→
+   392→임의 노드가 있는 동적 SDF 그래프는 다형성을 강제합니다. 성능을 위해 작성 시간 CSG를 플랫 인스턴스 데이터로 컴파일하고 가능한 경우 SoA 필드로 인스턴스 레벨 modifier만 저장합니다 (예: smooth k).
+   393→복잡한 노드를 지원해야 하는 경우 프레임당 FrameArena에 저장된 선형 프로그램(바이트코드)으로 컴파일하고 타이트 루프에서 해석합니다. 여전히 프로토콜 existential을 회피; 특수 인터프리터가 있는 enum opcode 사용.
+   394→
+   395→왜 이것이 Ikyo의 철학에 맞는가
+   396→
+   397→모놀리식이고 명시적: World는 엔진이 사용하는 컴포넌트에 대한 구체적인 스토리지를 소유합니다. 플러그인 레지스트리나 리플렉션 없음.
+   398→기존 할당자를 end-to-end로 사용:
+   399→
+   400→EngineBuffer는 자동으로 Binned/Large로 라우팅; 프레임당은 FrameArena.
+   401→핫 패스에 Foundation 컨테이너 없음.
+   402→
+   403→DOD 우선:
+   404→
+   405→SoA 배열, 캐시 정렬, 포인터 기반 반복.
+   406→쿼리는 렌더 프레임에서 해싱 없이 dense 인덱스 목록을 반환합니다.
+   407→
+   408→Swift 함정 회피:
+   409→
+   410→핫 루프에 프로토콜 existential 없음, ARC 없음, 동적 디스패치 없음, 최소 클로저.
+   411→
+   412→다음 단계 및 점진적 제공
+   413→
+   414→위와 같이 EntityManager 및 PackedSparseSet 구현 (먼저 단일 파일).
+   415→Transform, SDFSphere/Box, Material, TagRenderable, BoundsSphere 컴포넌트 추가.
+   416→FrameArena로 타입별 SoA 배열을 생성하는 BuildRayMarchSceneSystem 구현.
+   417→프레임 arena 재설정 및 BinnedAllocator.flushTLS()와 함께 world.beginFrame/world.endFrame 통합.
+   418→프로파일: Transform 액세스가 지배적인 경우 필요한 경우에만 Transform을 Position/Rotation/Scale SoA 스토리지로 분할.
+   419→FrameArena를 사용하여 BuildRayMarchSceneSystem에 간단한 공간 그리드 빌드 추가; 레이/타일당 후보 컬링.
+   420→
+   421→이 설계는 레이 마칭을 위한 높은 처리량, 캐시 친화적 반복을 제공하고, 할당자를 직접 활용하며, 모놀리식을 유지하고, Swift 제네릭을 사용하여 핫 패스에서 런타임 비용을 회피합니다.
