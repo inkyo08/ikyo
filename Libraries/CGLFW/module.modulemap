@@ -1,0 +1,6 @@
+module CGLFW {
+    header "include/glfw3.h"
+    header "include/glfw3native.h"
+    link "glfw3"
+    export *
+}
