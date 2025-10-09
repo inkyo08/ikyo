@@ -1,0 +1,1271 @@
+Bevy ECS Architecture Analysis
+==============================
+
+Based on comprehensive analysis of the bevy_ecs Rust implementation (~94K lines of code)
+
+---
+
+## 1. CORE ARCHITECTURE: Hybrid Archetype + Sparse Set
+
+Bevy ECS uses a **hybrid storage architecture**:
+
+- **Archetype-based (Table) storage** - Dense SoA layout for frequently queried components (DEFAULT)
+- **Sparse Set storage** - Fast insert/remove for high-churn components (OPT-IN)
+
+**Key Design Principle**:
+Each archetype represents a unique combination of component types. Entities with identical component sets belong to the same archetype. Multiple archetypes can share the same Table if they differ only in sparse-set components.
+
+**Architecture Decision: Archetypes, not pure sparse-sets**
+- Optimized for iteration speed over structural mutation speed
+- Cache-friendly data layout for queries
+- Trade-off: archetype transitions copy all components (expensive structural changes)
+
+
+---
+
+## 2. ENTITY REPRESENTATION
+
+### Entity Structure (entity/mod.rs)
+
+```rust
+#[repr(C, align(8))]
+pub struct Entity {
+    row: EntityRow,              // Index: NonMaxU32 (u32 excluding MAX)
+    generation: EntityGeneration, // u32 generation counter
+}
+```
+
+**Entity Properties**:
+- **64-bit total size**: 32 bits index + 32 bits generation
+- **Generational index**: Prevents ABA problem when reusing entity IDs
+- **NonMaxU32**: Uses u32::MAX as sentinel value (invalid entity)
+- **Generation wrapping**: Wraps at 2^31 to maintain approximate ordering
+- **Custom Ord implementation**: Optimized bit-based comparison for better codegen
+
+### EntityManager (Entities)
+
+**Key Features**:
+- **Freelist**: Reuses entity indices after despawn
+- **Atomic reservation**: Lock-free entity allocation for parallel spawning
+- **Flush mechanism**: Reserved entities require flush() to become valid
+- **Entity metadata**: Tracks EntityLocation per entity:
+  - `archetype_id`: Which archetype this entity belongs to
+  - `archetype_row`: Position within archetype entity list
+  - `table_id`: Which table stores components
+  - `table_row`: Row index in table columns
+
+**Lifecycle**:
+1. `reserve_entity()` - Atomically allocate from freelist
+2. `flush()` - Commit reserved entities
+3. `spawn()` - Create entity with components (triggers archetype assignment)
+4. `despawn()` - Remove entity, push index to freelist, increment generation
+
+
+---
+
+## 3. COMPONENT STORAGE IMPLEMENTATION
+
+### 3.1 Archetype System (archetype.rs)
+
+```rust
+pub struct Archetype {
+    id: ArchetypeId,
+    table_id: TableId,  // Shared table for component data
+    edges: Edges,       // Cached archetype transitions
+    entities: Vec<ArchetypeEntity>,  // List of entities in this archetype
+    components: ImmutableSparseSet<ComponentId, ArchetypeComponentInfo>,
+    flags: ArchetypeFlags,  // Bitflags for hooks/observers (fast early-out)
+}
+
+pub struct ArchetypeEntity {
+    entity: Entity,
+    table_row: TableRow,  // Index into table columns
+}
+```
+
+**Archetype Properties**:
+- **One per unique component set**: Archetype uniquely identifies component combination
+- **Never garbage collected**: Empty archetypes persist (memory trade-off for speed)
+- **Edge caching**: Caches bundle insert/remove transitions
+  - `SparseArray<BundleId, AddBundle>` - insert edges
+  - `SparseArray<BundleId, RemoveBundle>` - remove edges
+- **Flags for fast dispatch**: Track which components have hooks/observers
+
+**Edge Caching Example**:
+```
+Archetype(Transform, Velocity) --[+Material]--> Archetype(Transform, Velocity, Material)
+                              --[-Velocity]--> Archetype(Transform)
+```
+These transitions are cached per archetype to avoid repeated graph traversal.
+
+### 3.2 Table Storage (storage/table/mod.rs)
+
+**Structure-of-Arrays (SoA) Layout**:
+
+```rust
+pub struct Table {
+    columns: ImmutableSparseSet<ComponentId, ThinColumn>,
+    entities: Vec<Entity>,
+}
+
+pub struct ThinColumn {
+    data: BlobVec,              // Type-erased component data
+    added_ticks: BlobVec,       // Tick when component added
+    changed_ticks: BlobVec,     // Tick when component changed
+    changed_by: Option<BlobVec>,  // Debug: caller location (track_location feature)
+}
+```
+
+**Table Characteristics**:
+- **Column-oriented storage**: Each component type in separate contiguous array
+- **Excellent cache locality**: Queries iterate over dense, sequential memory
+- **Swap-remove semantics**: O(1) removal by swapping with last element
+- **Unified capacity**: All columns share same capacity (entities.capacity())
+- **Type erasure via BlobVec**: Raw memory management with stored layout + drop function
+- **Change detection metadata**: Per-element ticks for added/changed tracking
+
+**Memory Layout Example**:
+```
+Table for (Transform, Velocity):
+entities:       [E0, E1, E2, E3, ...]
+Transform col:  [T0, T1, T2, T3, ...]  <- dense, cache-friendly
+Velocity col:   [V0, V1, V2, V3, ...]  <- dense, cache-friendly
+added_ticks:    [t0, t1, t2, t3, ...]
+changed_ticks:  [t0, t1, t2, t3, ...]
+```
+
+**Swap-Remove**:
+```
+Remove E1:
+1. Swap E1 with last entity (E3)
+2. Update E3's archetype_row and table_row
+3. Pop last element from all columns
+Result: [E0, E3, E2, ...]
+```
+
+### 3.3 Sparse Set Storage (storage/sparse_set.rs)
+
+```rust
+pub struct ComponentSparseSet {
+    dense: Column,  // Packed component data + change tracking
+    entities: Vec<EntityRow>,  // Entity indices (or full Entity in debug mode)
+    sparse: SparseArray<EntityRow, TableRow>,  // Entity -> dense index map
+}
+```
+
+**Sparse Set Characteristics**:
+- **O(1) insertion/removal**: No archetype movement required
+- **Slower iteration**: Indirect lookup through sparse array
+- **Memory overhead**: Sparse array can be large for sparse entity IDs
+- **Use cases**:
+  - Marker components (zero-size types)
+  - Temporary flags
+  - High insertion/removal churn components
+
+**Storage Type Selection**:
+```rust
+#[derive(Component)]
+struct Transform;  // Default: Table storage
+
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+struct Temporary;  // Opt-in: Sparse set storage
+```
+
+**Trade-off Decision**:
+- **Table storage**: Fast queries (90% use case), slower add/remove
+- **Sparse set**: Fast add/remove, slower queries (10% use case)
+
+
+---
+
+## 4. QUERY SYSTEM DESIGN
+
+### 4.1 Query State (query/state.rs)
+
+```rust
+pub struct QueryState<D: QueryData, F: QueryFilter> {
+    world_id: WorldId,
+    archetype_generation: ArchetypeGeneration,  // Increments on archetype changes
+    matched_tables: FixedBitSet,      // Bitset of matching TableIds
+    matched_archetypes: FixedBitSet,  // Bitset of matching ArchetypeIds
+    component_access: FilteredAccess,  // For parallel execution validation
+    matched_storage_ids: Vec<StorageId>,  // Union type: TableId | ArchetypeId
+    is_dense: bool,  // Dense (table) vs archetypal iteration mode
+    fetch_state: D::State,
+    filter_state: F::State,
+}
+```
+
+**Query Lifecycle**:
+1. **Initialization**: Match query against all archetypes, build matched bitsets
+2. **Update check**: Compare archetype_generation, rebuild if world changed
+3. **Iteration**: Use matched_storage_ids to iterate over tables/archetypes
+4. **Access validation**: Check component_access for parallel system conflicts
+
+### 4.2 Iteration Modes
+
+**Dense Iteration** (is_dense = true):
+- Used when ALL queried components are table-stored
+- Iterate directly over Table rows
+- Fastest path: sequential memory access
+
+**Archetypal Iteration** (is_dense = false):
+- Used when ANY queried component is sparse-set stored
+- Iterate over archetypes, then entities within archetype
+- Slower: indirect lookups through sparse sets
+
+**Example**:
+```rust
+// Dense iteration (all table-stored)
+fn system(query: Query<(&Transform, &Velocity)>) {
+    for (transform, velocity) in &query {
+        // Direct table iteration
+    }
+}
+
+// Archetypal iteration (Material is sparse-set)
+fn system(query: Query<(&Transform, &Material)>) {
+    for (transform, material) in &query {
+        // Archetype iteration + sparse lookup for Material
+    }
+}
+```
+
+### 4.3 Query Filters
+
+**Filter Types**:
+- `With<T>` / `Without<T>` - Existence checks (no data access)
+- `Added<T>` - Components added since last system run
+- `Changed<T>` - Components added or modified since last run
+- `Or<(F1, F2, ...)>` - Disjunction of filters
+
+**Filter Implementation**:
+Filters implement `QueryFilter` trait with `archetype_filter_fetch()` and `table_filter_fetch()` methods. Filters don't fetch data, only boolean predicates.
+
+### 4.4 WorldQuery Trait
+
+**Core abstraction for query components**:
+```rust
+pub unsafe trait QueryData: WorldQuery {
+    type ReadOnly: ReadOnlyQueryData<State = Self::State>;
+}
+
+pub unsafe trait WorldQuery {
+    type Item<'a>;
+    type Fetch<'a>;
+    type State: Send + Sync + Sized;
+
+    // Matching logic
+    fn matches_component_set(state: &Self::State, set_contains_id: &impl Fn(ComponentId) -> bool) -> bool;
+
+    // Initialization
+    fn init_state(world: &mut World) -> Self::State;
+
+    // Access tracking
+    fn update_component_access(state: &Self::State, access: &mut FilteredAccess);
+}
+```
+
+**Derived for common patterns**:
+- `&T` - Immutable component access
+- `&mut T` - Mutable component access
+- `Option<&T>` - Optional component
+- `(A, B, C)` - Tuple composition
+- Custom types via `#[derive(QueryData)]`
+
+
+---
+
+## 5. BUNDLE SYSTEM
+
+### Bundle Trait
+
+```rust
+pub unsafe trait Bundle: DynamicBundle + Send + Sync + 'static {
+    fn component_ids(components: &mut ComponentsRegistrator, ids: &mut impl FnMut(ComponentId));
+    fn get_component_ids(components: &Components, ids: &mut impl FnMut(Option<ComponentId>));
+}
+```
+
+**Bundle Properties**:
+- **Static component groups**: Type-safe sets of components
+- **Automatic derivation**: `#[derive(Bundle)]` generates implementation
+- **Optimized insertion**: Single archetype transition for multiple components
+- **Required components**: Bundles can specify dependencies
+
+### BundleInfo
+
+**Per-bundle metadata**:
+```rust
+pub struct BundleInfo {
+    id: BundleId,
+    component_ids: Vec<ComponentId>,  // Sorted for deterministic ordering
+    required_components: RequiredComponents,  // Dependency tree
+    storage_types: Vec<StorageType>,  // Table or SparseSet per component
+}
+```
+
+**Required Components** (NEW in Bevy 0.15+):
+```rust
+#[derive(Component)]
+#[require(B, C)]  // A requires B and C
+struct A;
+
+world.spawn(A);  // Automatically inserts B and C
+```
+
+**Dependency Resolution**:
+- Depth-first search through requirement graph
+- Detects cycles during registration
+- Override constructors: customize initialization of required components
+- Inheritance semantics: B requires C, A requires B → A transitively requires C
+
+### Bundle Spawner
+
+**Optimized batch insertion**:
+```rust
+pub struct BundleSpawner<'w> {
+    entities: &'w Entities,
+    bundle_info: &'w BundleInfo,
+    table: &'w mut Table,
+    archetype: &'w mut Archetype,
+    change_tick: Tick,
+}
+```
+
+**spawn() fast path**:
+1. Reserve table row
+2. Write component data to table columns
+3. Add entity to archetype entity list
+4. Update entity metadata (location)
+5. Trigger component hooks if present
+
+**Batch spawning**: Amortizes archetype lookup and table allocation across multiple entities.
+
+
+---
+
+## 6. CHANGE DETECTION MECHANISM
+
+### Tick System (component/tick.rs)
+
+```rust
+#[derive(Copy, Clone, Debug)]
+pub struct ComponentTicks {
+    added: Tick,     // When component was added (u32)
+    changed: Tick,   // When component was last mutated (u32)
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Tick(u32);  // Monotonically increasing tick counter
+```
+
+**World Tick Management**:
+- `World.increment_change_tick()` called once per schedule run
+- Wraps at `u32::MAX` (handled via "tick aging")
+- Stores `last_change_tick` and `change_tick` for delta queries
+
+**Change Tracking**:
+- **Added tick**: Set when component first inserted
+- **Changed tick**: Updated on `DerefMut` (mutable access)
+- **Automatic**: No manual dirty marking required
+
+**Query Filters**:
+```rust
+fn system(
+    mut query: Query<&mut Transform, Changed<Transform>>,
+    time: Res<Time>,
+) {
+    // Only iterates entities where Transform changed since last run
+    for mut transform in &mut query {
+        // Accessing &mut automatically updates changed tick
+    }
+}
+```
+
+### Change Detection Implementation
+
+**Mut<T> wrapper**:
+```rust
+pub struct Mut<'a, T> {
+    value: &'a mut T,
+    ticks: &'a mut ComponentTicks,
+    change_tick: Tick,
+}
+
+impl<T> DerefMut for Mut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.ticks.changed = self.change_tick;  // Mark changed
+        self.value
+    }
+}
+```
+
+**Bypassing change detection**:
+```rust
+// Don't mark as changed
+query.get_mut(entity).unwrap().bypass_change_detection().x = 10.0;
+
+// Or set explicitly
+query.get_mut(entity).unwrap().set_changed();
+```
+
+### Caller Tracking (Debug Feature)
+
+Optional `#[cfg(feature = "track_location")]`:
+- Stores `&'static Location` per component change
+- Helps debug unexpected mutations
+- Significant memory overhead
+
+
+---
+
+## 7. SYSTEM EXECUTION AND SCHEDULING
+
+### System Types
+
+**1. Function Systems**:
+```rust
+fn movement(mut query: Query<(&mut Position, &Velocity)>, time: Res<Time>) {
+    for (mut pos, vel) in &mut query {
+        pos.x += vel.x * time.delta_seconds();
+    }
+}
+```
+
+**2. Exclusive Systems**:
+```rust
+fn exclusive_system(world: &mut World) {
+    // Full world access, blocks parallel execution
+}
+```
+
+**3. Observer Systems**:
+```rust
+world.add_observer(|trigger: Trigger<MyEvent>| {
+    println!("Event triggered!");
+});
+```
+
+### Schedule (schedule/mod.rs)
+
+**Schedule Structure**:
+```rust
+pub struct Schedule {
+    graph: ScheduleGraph,  // System dependency graph
+    executable: SystemSchedule,  // Flattened execution plan
+    executor: Box<dyn SystemExecutor>,  // Parallel or single-threaded
+}
+```
+
+**Execution Flow**:
+1. **Graph construction**: Build DAG from system ordering constraints
+2. **Access conflict detection**: Validate parallel-safe execution
+3. **Topological sort**: Order systems respecting dependencies
+4. **Parallel batching**: Group non-conflicting systems into parallel sets
+5. **Execution**: Run batches, inserting "apply deferred" commands as needed
+
+### System Ordering
+
+**Explicit ordering**:
+```rust
+app.add_systems(Update, (
+    physics_system.before(collision_system),
+    collision_system.after(physics_system),
+));
+```
+
+**System sets**:
+```rust
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash)]
+enum MySet {
+    Input,
+    Logic,
+    Render,
+}
+
+app.configure_sets(Update, (MySet::Input, MySet::Logic, MySet::Render).chain());
+app.add_systems(Update, (
+    handle_input.in_set(MySet::Input),
+    game_logic.in_set(MySet::Logic),
+));
+```
+
+### Access Conflict Detection
+
+**FilteredAccess**:
+```rust
+pub struct FilteredAccess {
+    access: Access,  // Read/write component access
+    required: FixedBitSet,  // Required components for query matching
+    filter_sets: Vec<AccessFilters>,  // Filter conditions (With/Without)
+}
+
+pub struct Access {
+    reads_all: bool,
+    writes_all: bool,
+    component_read_and_writes: FixedBitSet,
+    component_reads: FixedBitSet,
+    component_writes: FixedBitSet,
+}
+```
+
+**Conflict rules**:
+- Mutable access conflicts with any other access
+- Multiple immutable accesses are safe
+- Disjoint filters (With/Without) can enable parallel execution
+
+**Example**:
+```rust
+// Safe to run in parallel (disjoint filters)
+fn sys1(query: Query<&mut Transform, With<Player>>) { }
+fn sys2(query: Query<&mut Transform, Without<Player>>) { }
+
+// Conflicts (overlapping writes)
+fn sys3(query: Query<&mut Transform>) { }
+fn sys4(query: Query<&mut Transform>) { }
+```
+
+### Command Buffers
+
+**Deferred world mutations**:
+```rust
+fn system(mut commands: Commands) {
+    let entity = commands.spawn((Transform::default(), Velocity::default())).id();
+    commands.entity(entity).insert(Health(100));
+    commands.entity(other).despawn();
+}
+```
+
+**Commands are applied**:
+- At explicit sync points (`apply_deferred`)
+- Automatically between incompatible systems
+- After each system set
+
+**Implementation**: Commands queue closures that mutate world when flushed.
+
+
+---
+
+## 8. MEMORY MANAGEMENT
+
+### Allocation Strategy
+
+**BlobVec** (storage/blob_vec.rs):
+```rust
+pub struct BlobVec {
+    item_layout: Layout,
+    capacity: usize,
+    len: usize,
+    data: NonNull<u8>,  // Raw allocation
+    drop: Option<unsafe fn(*mut u8)>,  // Per-item drop function
+}
+```
+
+**Manual memory management**:
+- Uses `std::alloc::{alloc, realloc, dealloc}` directly
+- Type-erased storage via `Layout` + drop function pointer
+- No garbage collection or reference counting
+
+**Safety mechanisms**:
+- `AbortOnPanic` guard during reallocation (prevents UB if drop panics)
+- Careful pointer arithmetic and alignment tracking
+- Drop logic runs for each element on dealloc
+
+### Memory Trade-offs
+
+**No archetype cleanup**:
+- Empty archetypes persist forever
+- Trade memory for deterministic performance
+- Avoids archetype ID reuse bugs
+
+**Table capacity management**:
+- Reserve in batches (amortized allocation)
+- Swap-remove avoids shifting elements
+- All columns share same capacity
+
+**Entity freelist**:
+- Reuses entity IDs to bound entity count
+- Generation counter prevents aliasing
+- Atomic operations for concurrent allocation
+
+### Memory Layout Example
+
+**Table for (Transform, Velocity)**:
+```
+Memory layout for 1000 entities:
+
+entities:        [4KB] Vec<Entity>
+Transform:       [48KB] BlobVec (48 bytes each)
+  data:          [48KB] aligned to 64 bytes
+  added_ticks:   [4KB]
+  changed_ticks: [4KB]
+Velocity:        [24KB] BlobVec (24 bytes each)
+  data:          [24KB] aligned to 64 bytes
+  added_ticks:   [4KB]
+  changed_ticks: [4KB]
+
+Total: ~120KB for 1000 entities
+Cache-friendly: Components stored contiguously
+```
+
+
+---
+
+## 9. PERFORMANCE OPTIMIZATIONS
+
+### 1. Archetype Edge Caching
+
+**Problem**: Repeatedly looking up archetype transitions is expensive.
+
+**Solution**: Cache insert/remove edges per archetype:
+```rust
+pub struct Edges {
+    add_bundle: SparseArray<BundleId, AddBundle>,
+    remove_bundle: SparseArray<BundleId, RemoveBundle>,
+}
+```
+
+**Result**: O(1) archetype transition after first lookup.
+
+### 2. Bitset Archetype Matching
+
+**Problem**: Checking each archetype for query match is expensive.
+
+**Solution**: Precompute matched archetypes as `FixedBitSet`:
+```rust
+matched_archetypes: FixedBitSet,  // Bit per archetype
+```
+
+**Result**:
+- Fast iteration over matched archetypes
+- Quick invalidation check via generation counter
+
+### 3. SoA Layout for Cache Locality
+
+**Problem**: AoS layout causes cache misses when accessing single component type.
+
+**Solution**: Store each component type in separate contiguous array.
+
+**Result**:
+- Excellent cache prefetching
+- SIMD-friendly iteration
+- Minimize cache line pollution
+
+### 4. Dense vs Archetypal Iteration
+
+**Problem**: Sparse set lookups add indirection overhead.
+
+**Solution**: Use fast table iteration when all components are table-stored.
+
+**Result**:
+- Zero indirection for common case
+- Fallback to archetypal only when needed
+
+### 5. Generation-Based Update Tracking
+
+**Problem**: Checking if new archetypes were created is expensive.
+
+**Solution**: Increment `ArchetypeGeneration` on archetype creation, cache in query state.
+
+**Result**:
+- Single integer comparison to check if re-matching needed
+- Avoid unnecessary archetype iteration
+
+### 6. Parallel Iteration
+
+**Work-stealing task pool**:
+```rust
+query.par_iter().for_each(|component| {
+    // Parallel execution across available threads
+});
+```
+
+**Batching**:
+- Divide matched tables into chunks
+- Submit chunks to task pool
+- Dynamic work stealing balances load
+
+### 7. Table Sharing
+
+**Problem**: Each archetype having separate storage wastes memory.
+
+**Solution**: Multiple archetypes share same `Table` if they differ only in sparse-set components.
+
+**Example**:
+```
+Archetype(Transform, Velocity, TagA[sparse])  ─┐
+                                              ├──> Same Table(Transform, Velocity)
+Archetype(Transform, Velocity, TagB[sparse])  ─┘
+```
+
+**Result**: Memory savings + better cache utilization.
+
+### 8. Component Access Granularity
+
+**Problem**: Coarse access tracking blocks parallelism.
+
+**Solution**: Track access per-component, not per-system.
+
+**Result**:
+- Systems with disjoint component access run in parallel
+- Filters (With/Without) enable further parallelism
+
+
+---
+
+## 10. ADVANCED FEATURES
+
+### 10.1 Component Hooks
+
+**Lifecycle callbacks**:
+```rust
+world.register_component_hooks::<MyComponent>()
+    .on_add(|mut world, entity, component_id| {
+        println!("Component added to entity {}", entity);
+    })
+    .on_insert(|mut world, entity, component_id| {
+        println!("Component inserted (replaced)");
+    })
+    .on_replace(|mut world, entity, component_id| {
+        println!("Component about to be replaced");
+    })
+    .on_remove(|mut world, entity, component_id| {
+        println!("Component removed");
+    });
+```
+
+**Use cases**:
+- Relationship cleanup (e.g., remove children on parent despawn)
+- Index updates (e.g., spatial hash invalidation)
+- Logging/debugging
+
+### 10.2 Observers
+
+**Event-driven reactivity**:
+```rust
+world.add_observer(|trigger: Trigger<OnAdd, Transform>| {
+    println!("Transform added to entity {}", trigger.entity());
+});
+```
+
+**Built-in events**:
+- `OnAdd` - Component added
+- `OnInsert` - Component inserted (first time or replacement)
+- `OnReplace` - Component about to be replaced
+- `OnRemove` - Component removed
+
+**Custom events**:
+```rust
+#[derive(Event)]
+struct Damage {
+    amount: f32,
+}
+
+world.add_observer(|trigger: Trigger<Damage>, mut query: Query<&mut Health>| {
+    if let Ok(mut health) = query.get_mut(trigger.entity()) {
+        health.0 -= trigger.event().amount;
+    }
+});
+
+world.trigger_targets(Damage { amount: 10.0 }, entity);
+```
+
+**Propagation**: Observers can trigger other events recursively.
+
+### 10.3 Relationships
+
+**Entity-entity connections**:
+```rust
+#[derive(Component)]
+struct ChildOf(Entity);  // Relationship component
+
+let parent = world.spawn_empty().id();
+let child = world.spawn(ChildOf(parent)).id();
+```
+
+**Hierarchy traversal**:
+```rust
+fn traverse_children(query: Query<(Entity, &ChildOf)>, parent: Entity) {
+    for (entity, child_of) in &query {
+        if child_of.0 == parent {
+            println!("Found child: {}", entity);
+        }
+    }
+}
+```
+
+**Automatic cleanup**: Hooks can despawn children when parent despawned.
+
+### 10.4 Messages/Events
+
+**Type-safe event streams**:
+```rust
+#[derive(Message)]
+struct Collision {
+    a: Entity,
+    b: Entity,
+}
+
+fn writer(mut writer: MessageWriter<Collision>) {
+    writer.write(Collision { a: entity1, b: entity2 });
+}
+
+fn reader(mut reader: MessageReader<Collision>) {
+    for collision in reader.read() {
+        println!("Collision between {} and {}", collision.a, collision.b);
+    }
+}
+```
+
+**Differences from Observers**:
+- **Messages**: Deferred, processed at specific schedule points
+- **Observers**: Immediate, recursive, event-driven
+
+### 10.5 Resources
+
+**Singleton data**:
+```rust
+#[derive(Resource)]
+struct Time {
+    delta: f32,
+}
+
+world.insert_resource(Time { delta: 0.016 });
+
+fn system(time: Res<Time>) {
+    println!("Delta: {}", time.delta);
+}
+
+fn system_mut(mut time: ResMut<Time>) {
+    time.delta = 0.016;
+}
+```
+
+**Implementation**: Resources stored in dedicated `Resources` struct, accessed via type ID.
+
+
+---
+
+## 11. KEY DESIGN PATTERNS AND TRADE-OFFS
+
+### Archetype Graph Model
+
+**Conceptual model**:
+```
+Vertices: Archetypes
+Edges: Bundle insert/remove operations
+Caching: Edge results cached per archetype
+```
+
+**Benefits**:
+- Deterministic archetype assignment
+- Efficient query matching
+- Predictable memory layout
+
+**Drawbacks**:
+- Structural changes expensive (copy all components)
+- Archetype proliferation can occur
+- Empty archetypes never freed
+
+**Best practices**:
+- Minimize structural changes (add/remove components)
+- Use flags/enums within components instead of adding/removing components
+- Batch structural changes when possible
+
+### Storage Type Decision Matrix
+
+| Access Pattern | Recommendation | Reason |
+|---------------|----------------|--------|
+| Queried frequently, rarely added/removed | Table | Cache-friendly iteration |
+| Added/removed frequently, rarely queried | SparseSet | Fast structural changes |
+| Marker/tag components | SparseSet | Zero-size, no data to iterate |
+| Large components (>256 bytes) | Table | Amortizes copy cost |
+| Small, hot-path components | Table | Maximize cache utilization |
+
+### Query Optimization Strategies
+
+**1. Filter early**:
+```rust
+// Good: Filter reduces iteration count
+Query<&Transform, (With<Player>, Without<Dead>)>
+
+// Bad: No filtering, iterates all entities with Transform
+Query<&Transform>
+```
+
+**2. Minimize mutable access**:
+```rust
+// Good: Only Position is mutable
+Query<(&mut Position, &Velocity)>
+
+// Bad: Unnecessary mutable access blocks parallelism
+Query<(&mut Position, &mut Velocity)>
+```
+
+**3. Use change detection**:
+```rust
+// Good: Only process changed entities
+Query<&mut Transform, Changed<Velocity>>
+
+// Bad: Process all entities every frame
+Query<&mut Transform>
+```
+
+**4. Avoid overlapping queries**:
+```rust
+// Good: Can run in parallel
+fn sys1(q: Query<&Transform, With<Player>>) {}
+fn sys2(q: Query<&Transform, Without<Player>>) {}
+
+// Bad: Sequential execution required
+fn sys3(q: Query<&Transform>) {}
+fn sys4(q: Query<&Transform>) {}
+```
+
+### Required Components Pattern
+
+**Problem**: Ensuring component invariants (e.g., Transform requires GlobalTransform).
+
+**Old approach**: Manual insertion or bundle wrapping.
+
+**New approach**: Automatic requirement resolution:
+```rust
+#[derive(Component)]
+#[require(GlobalTransform)]
+struct Transform { /* ... */ }
+
+world.spawn(Transform::default());  // GlobalTransform automatically inserted
+```
+
+**Benefits**:
+- Enforced invariants at type level
+- Reduced boilerplate
+- Clearer component dependencies
+
+**Gotchas**:
+- Circular dependencies detected at registration
+- Override constructors can be complex
+- Inheritance requires careful design
+
+
+---
+
+## 12. SWIFT TRANSLATION CONSIDERATIONS
+
+### Challenges
+
+**1. No unsafe code**:
+- Rust's unsafe allows type-erased storage (BlobVec)
+- Swift requires different approach: protocols or generics
+- Consideration: Use `any Component` existentials or generic containers
+
+**2. Type erasure differences**:
+- Rust: `BlobVec` stores raw bytes + drop function
+- Swift: Existential types have overhead, generics monomorphize
+- Consideration: Protocol witness tables vs monomorphization trade-off
+
+**3. Memory management**:
+- Rust: Manual allocation with precise control
+- Swift: ARC adds overhead for reference types
+- Consideration: Use value types for components, minimize class references
+
+**4. Concurrency models**:
+- Rust: Send/Sync traits enable compiler-checked parallelism
+- Swift: Actor model + structured concurrency
+- Consideration: Actor-isolated systems vs shared mutable state
+
+**5. Zero-cost abstractions**:
+- Rust: Guaranteed zero-overhead generics, inline, LTO
+- Swift: Some abstraction overhead (protocol witnesses, existentials)
+- Consideration: Careful profiling, @inlinable annotations
+
+### Opportunities
+
+**1. Protocol-oriented design**:
+```swift
+protocol Component: Sendable {
+    static var storageType: StorageType { get }
+}
+
+protocol QueryData {
+    associatedtype Item
+    associatedtype State
+
+    static func matches(state: State, components: Set<ComponentId>) -> Bool
+    static func fetch(state: State, entity: Entity) -> Item?
+}
+```
+
+**2. Value semantics**:
+- Components as structs (value types) align well with ECS
+- Copy-on-write can optimize archetype moves
+- No reference counting overhead for POD components
+
+**3. Existential types**:
+```swift
+// Type-erased component storage
+struct Column {
+    var storage: any ComponentStorage
+}
+
+protocol ComponentStorage {
+    func get(index: Int) -> Any
+    mutating func set(index: Int, value: Any)
+    mutating func swapRemove(index: Int)
+}
+```
+
+**4. Structured concurrency**:
+```swift
+await withTaskGroup { group in
+    for chunk in query.chunks() {
+        group.addTask {
+            await processChunk(chunk)
+        }
+    }
+}
+```
+
+**5. Copy-on-write optimization**:
+```swift
+struct Table {
+    private var storage: Storage  // COW reference type
+
+    mutating func modify() {
+        if !isKnownUniquelyReferenced(&storage) {
+            storage = storage.copy()
+        }
+    }
+}
+```
+
+### Recommended Approach for Ikyo
+
+**Phase 1: Simplified architecture**
+- Start with **table-only storage** (no sparse sets initially)
+- Use **protocols for Component/Query** with associated types
+- Implement **generational entity** (UInt32 index + UInt32 generation)
+- Build **basic archetype system** with edge caching
+
+**Phase 2: Performance optimization**
+- Add **sparse set storage** for opt-in components
+- Implement **change detection** with explicit tick management
+- Build **parallel query iteration** using Swift concurrency
+- Profile and optimize hot paths with `@inlinable`
+
+**Phase 3: Advanced features**
+- Add **component hooks** for lifecycle callbacks
+- Implement **required components** pattern
+- Build **observer system** for event reactivity
+- Add **relationship components** for hierarchies
+
+**Key Decisions**:
+
+1. **Component storage**: Protocol with generic implementations
+   ```swift
+   protocol Component: Sendable {
+       static var id: ComponentId { get }
+   }
+
+   struct ComponentStorage<T: Component> {
+       var data: UnsafeMutableBufferPointer<T>
+       var entities: [Entity]
+       var addedTicks: [Tick]
+       var changedTicks: [Tick]
+   }
+   ```
+
+2. **Query system**: Generic over QueryData protocol
+   ```swift
+   struct Query<D: QueryData> {
+       var state: QueryState<D>
+
+       func iter() -> QueryIter<D> { ... }
+   }
+   ```
+
+3. **Archetype representation**:
+   ```swift
+   struct Archetype {
+       let id: ArchetypeId
+       var tableId: TableId
+       var entities: [ArchetypeEntity]
+       var edges: ArchetypeEdges
+   }
+   ```
+
+4. **Memory allocation**: Use EngineBuffer (already in Ikyo)
+   ```swift
+   struct Table {
+       var columns: [ComponentId: Column]
+       var entities: EngineBuffer<Entity>
+   }
+
+   struct Column {
+       var data: EngineBuffer<UInt8>  // Type-erased
+       var addedTicks: EngineBuffer<Tick>
+       var changedTicks: EngineBuffer<Tick>
+   }
+   ```
+
+5. **Avoid ARC in hot paths**:
+   - Components must be POD (no class references)
+   - Use UnsafePointer for direct memory access
+   - EngineBuffer already avoids ARC
+
+### Performance Considerations
+
+**Swift-specific optimizations**:
+
+1. **@inlinable for hot paths**:
+   ```swift
+   @inlinable
+   public func get(_ entity: Entity) -> T? {
+       guard let index = sparse[entity.index] else { return nil }
+       return data[index]
+   }
+   ```
+
+2. **UnsafePointer for tight loops**:
+   ```swift
+   data.withUnsafeMutableBufferPointer { buffer in
+       for i in 0..<count {
+           buffer[i].update()
+       }
+   }
+   ```
+
+3. **Avoid protocol existentials in iteration**:
+   ```swift
+   // Bad: Type-erased iteration
+   for component in components as [any Component] { }
+
+   // Good: Monomorphic iteration
+   func iterate<T: Component>(_ components: [T]) {
+       for component in components { }
+   }
+   ```
+
+4. **Use NonMaxU32 pattern** (Swift equivalent):
+   ```swift
+   struct EntityIndex: RawRepresentable {
+       var rawValue: UInt32
+
+       static let invalid = EntityIndex(rawValue: .max)
+   }
+   ```
+
+5. **Leverage FrameArena** (already in Ikyo):
+   - Use for per-frame query results
+   - Temporary storage for archetype transitions
+   - Batch allocations
+
+### Simplified Starting Design
+
+```swift
+// Entity (64-bit)
+struct Entity: Hashable {
+    var index: UInt32
+    var generation: UInt32
+}
+
+// Component protocol
+protocol Component: Sendable {
+    static var id: ComponentId { get }
+}
+
+// World
+final class World {
+    var entities: EntityManager
+    var archetypes: [Archetype]
+    var tables: [Table]
+    var tick: Tick
+
+    func spawn<B: Bundle>(_ bundle: B) -> Entity { ... }
+    func despawn(_ entity: Entity) { ... }
+    func query<D: QueryData>() -> Query<D> { ... }
+}
+
+// Query
+struct Query<D: QueryData> {
+    var state: QueryState<D>
+
+    func iter() -> QueryIterator<D> { ... }
+}
+
+// System
+protocol System {
+    func run(world: inout World)
+}
+
+// Schedule
+struct Schedule {
+    var systems: [any System]
+
+    func run(world: inout World) {
+        for system in systems {
+            system.run(world: &world)
+        }
+    }
+}
+```
+
+---
+
+## 13. SUMMARY: KEY TAKEAWAYS
+
+### Architecture
+- **Hybrid archetype + sparse set** for flexibility
+- **SoA table storage** for cache-friendly queries (default)
+- **Sparse sets** for high-churn components (opt-in)
+- **Edge caching** for fast archetype transitions
+
+### Entities
+- **Generational indices** (64-bit: 32 index + 32 generation)
+- **Freelist** for entity reuse
+- **Metadata tracking** (archetype + table locations)
+
+### Components
+- **Table columns** (BlobVec) with type erasure
+- **Change detection** via added/changed ticks
+- **Optional sparse set** storage per component
+- **Automatic change tracking** on mutable access
+
+### Queries
+- **Dense vs archetypal** iteration modes
+- **Bitset matching** for fast archetype filtering
+- **Parallel-safe** access tracking
+- **Filter optimization** (With/Without/Changed/Added)
+
+### Systems
+- **Dependency graph** for ordering
+- **Parallel execution** with automatic conflict detection
+- **Command buffers** for deferred mutations
+- **Observers** for event-driven reactivity
+
+### Performance
+- **Zero archetype cleanup** (memory for speed trade-off)
+- **Swap-remove** for O(1) deletion
+- **Batch operations** amortize allocation costs
+- **Cache-friendly** SoA layout
+- **Parallel iteration** via work-stealing
+
+### Swift Translation
+- Start simple: **table-only storage**
+- Use **protocols + generics** carefully (avoid existentials in hot paths)
+- Leverage **value semantics** and **EngineBuffer**
+- Implement **change detection** explicitly
+- Profile and optimize with **@inlinable**
+- Consider **Copy-on-Write** for archetype moves
+
+### Design Philosophy
+Bevy ECS prioritizes:
+1. **Query iteration speed** over structural mutation speed
+2. **Deterministic performance** over memory efficiency
+3. **Type safety** over dynamic flexibility
+4. **Parallelism** through compile-time access tracking
+5. **Ergonomics** via Rust's type system (fewer macros)
+
+This analysis covers the core architecture of bevy_ecs. The implementation demonstrates mature ECS design optimized for game engine workloads through careful use of data-oriented patterns, caching, and zero-cost abstractions.
