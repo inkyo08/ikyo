@@ -25,6 +25,12 @@ let package = Package(
             ],
             linkerSettings: [
                 .unsafeFlags(["-L/Users/asdf/work/ikyo/Libraries/CGLFW/bin/lib-arm64"]),
+                .linkedFramework("Cocoa"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("OpenGL"),
+                .linkedFramework("AppKit")
             ]
         ),
     ]

@@ -8,14 +8,23 @@ final class GameLoop {
     game.exit()
   }
 
-  var doFrame = false
+  var doFrame = true
+  
+  let windowWidth: Int32 = 800
+  let windowHeight: Int32 = 600
+  
+  private var window: ikyoWindow?
 
   // MARK: - Initialize
-  func initialize() {}
+  func initialize() {
+    window = ikyoWindow(w: windowWidth, h: windowHeight, name: "Ikyo")
+  }
 
   // MARK: - Update
   func update() {
-    while doFrame {}
+    while doFrame {
+      window?.pollEvents()
+    }
   }
 
   // MARK: - Exit
