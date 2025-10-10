@@ -1,0 +1,638 @@
+이 Ikyo 게임 엔진 코드베이스를 기반으로, 기존 구조와 철학에 맞는 고성능 ECS (Entity Component System) 아키텍처를 설계하세요.
+
+요구사항:
+
+모놀리식 아키텍처 철학을 따르세요 (플러그인 없음, 통합형)
+기존 커스텀 메모리 할당자 사용 (BinnedAllocator, LargeAllocator, Arena)
+SVOGI (복셀 콘 트레이싱) + SVO-DDA 레이 마칭 렌더링 워크로드에 최적화
+최대 성능 - Swift의 제네릭 활용 및 핫 패스에서 프로토콜 existential 회피
+DOD (Data-Oriented Design) 원칙을 위한 설계
+이것이 SVOGI + 레이 마칭 렌더러임을 고려 (전통적인 래스터화가 아님)
+
+다음을 제공해주세요:
+
+완전한 ECS 아키텍처 설계 (sparse-set vs archetype 권장사항)
+구체적인 코드 구조 및 파일 구성
+기존 메모리 시스템과의 통합 지점
+SVOGI + 레이 마칭 워크로드를 위한 컴포넌트, 시스템, 쿼리 구조화 방법
+이 코드베이스에 특화된 성능 크리티컬 고려사항
+
+
+
+----
+
+다음은 모놀리식을 유지하고, 할당자를 직접 사용하며, SVOGI (Sparse Voxel Octree Global Illumination) + SVO-DDA 레이 마칭 렌더러와 Swift 성능 특성에 맞춰 조정된 Ikyo를 위한 구체적인 ECS 설계입니다. SoA 레이아웃, 제네릭 전용 API를 우선시하며, 핫 패스에서 ARC 및 프로토콜 existential을 회피합니다.
+
+아키텍처: 캐시된 뷰(SoA)를 가진 하이브리드 sparse-set, archetype 아님
+
+근거:
+
+SVOGI + 레이 마칭은 알려진 컴포넌트 세트를 순회합니다 (Transform + Voxelizable/Mesh + Material + Bounds + Lights). 일반적으로 쿼리되는 컴포넌트 조합 세트는 고정되어 있고 작습니다.
+Sparse-set 스토리지는 O(1) 추가/제거, 안정적인 연속 반복 순서를 제공하며, 구성 변경 시 전체 행 이동이 없습니다 (archetype과 달리).
+컴포넌트별로 캐시 친화적인 밀집 배열을 유지합니다 (SoA). 쿼리는 밀집 배열을 한 번 교차한 다음 매 프레임 결과를 스트리밍합니다.
+핫 조합(예: Renderable + Voxelizable + Transform + Material)을 위한 사전 계산된 "뷰"(캐시된 교집합)를 추가하여 프레임당 반복적인 세트 교차를 제거합니다. 이러한 "뷰"는 추가/제거 시 점진적으로 재구축되거나 FrameArena를 사용하여 프레임당 지연 재구축됩니다.
+Archetype은 여기서 과도하며, 단편화, 높은 변경 비용, 모놀리식 고정 시스템 렌더러에 이점이 없는 복잡성을 도입합니다.
+
+핵심 설계:
+
+Entity = 32비트 패킹된 ID (인덱스: 24비트, 세대: 8비트). 세대는 ABA 재사용을 방지합니다. 재사용을 위한 프리 리스트.
+ComponentStorage: 다음을 가진 패킹된 sparse-set:
+
+denseEntities: EngineBuffer<Entity>
+dense: EngineBuffer<T> (64바이트 정렬)
+sparse: entityIndex -> denseIndex (또는 -1)를 매핑하는 페이지드 또는 플랫 EngineBuffer
+LargeAllocator를 사용한 수동 증가를 가진 size/capacity (EngineBuffer를 통해).
+핫 패스를 위한 Unsafe 포인터 API로 Add/Remove/Has/Get, existential/프로토콜 기계 없음.
+
+쿼리 뷰:
+
+특정 조합을 위해 사전 계산된 밀집 인덱스 리스트를 보유하는 작은 고정 구조체, 더티로 표시될 때 재구축됨.
+원하는 경우 빠른 점진적 무효화를 위한 뷰 멤버십 비트셋/태그된 블룸 저장 (선택사항).
+
+시스템은 스토리지에 대해 매개변수화된 일반 함수입니다. 프로토콜 System 없음. 핫 루프를 단형으로 유지합니다.
+
+렌더링 파이프라인 개요
+
+G-Buffer: SVO-DDA 레이 마칭 (Primary visibility)
+  └─ Sparse Voxel Octree 순회
+  └─ 복셀 순회를 위한 3D-DDA
+  └─ Normal, Material ID, Depth 추출
+
+GI: SVOGI 콘 트레이싱
+  └─ Diffuse 간접 조명
+  └─ Ambient occlusion
+
+거울 반사: SVO-DDA 레이 마칭
+  └─ 반사 벡터 방향으로 레이 마칭
+  └─ 1-2 바운스 제한
+  └─ SVO 계층을 통한 빠른 순회
+
+광택 반사: 콘 트레이싱 (추가 최적화)
+  └─ 비완전 거울을 콘으로 근사
+  └─ 거칠기에 따라 콘 각도 조정
+
+투명/굴절: SVO-DDA 레이 마칭
+  └─ 굴절 벡터 계산 후 레이 마칭
+  └─ 감쇠를 위한 Beer의 법칙
+  └─ 복셀 밀도를 통한 볼륨 표현
+
+그림자: SVO-DDA 레이 마칭
+  └─ 광원을 향해 레이 마칭
+  └─ 조기 종료 (첫 번째 히트에서 중지)
+  └─ 콘 트레이싱을 통한 소프트 섀도우
+
+구체적인 코드 구조 및 파일 구성
+
+ecs/Entity.swift
+
+Entity (UInt32 id), 세대, 프리리스트, 용량 관리를 가진 EntityManager.
+
+ecs/storage/PackedSparseSet.swift
+
+struct PackedSparseSet<T> { … } EngineBuffer, EngineBuffer, EngineBuffer 사용
+인라인 add/remove/has/get/forEach
+
+ecs/World.swift
+
+final class World { 엔티티, 및 구체적인 스토리지:
+
+transforms: PackedSparseSet<Transform>
+materials: PackedSparseSet<MaterialPBR>
+renderable: PackedSparseSet<TagRenderable> (태그 = 빈 구조체)
+voxelizable: PackedSparseSet<TagVoxelizable>
+bounds: PackedSparseSet<BoundsAABB> 또는 BoundsSphere
+meshRef: PackedSparseSet<MeshRef>
+transparent: PackedSparseSet<Transparent>
+lightDirectional: PackedSparseSet<LightDirectional>
+lightPoint: PackedSparseSet<LightPoint>
+lightSpot: PackedSparseSet<LightSpot>
+voxelizeDirty: PackedSparseSet<VoxelizeDirty> (태그)
+tagDynamic: PackedSparseSet<TagDynamic>
+선택사항: sdfSphere/sdfBox/sdfCapsule (레거시 SDF 지원)
+캐시된 뷰 (구조체), 더티 플래그
+프레임당 frameArena: FrameArena
+svoScene: SVOScene (이중 버퍼링)
+svogi: SVOGIState
+gbuffer: GBufferTargets
+}
+
+ecs/Query.swift
+
+(Renderable + Voxelizable + Transform + Material) 등을 위한 뷰를 구축하는 함수; FrameArena를 사용하여 밀집 인덱스 배열 반환.
+
+ecs/Systems/*
+
+Spawn/Destroy/컴포넌트 연결
+TransformSystem (선택적 계층: 월드 변환 사전 계산)
+BoundsSystem (Transform + mesh/SDF에서 BoundsAABB 또는 BoundsSphere 계산/업데이트)
+ChangeTrackingSystem (Transform/Material 변경 시 VoxelizeDirty 표시)
+BuildSVOSystem (ECS를 SVO로 컴파일, 점진적 또는 전체 재구축)
+BuildSVOMipsSystem (콘 트레이싱을 위한 하위 밉 레벨 생성)
+LightInjectionSystem (광원에서 SVO로 radiance 주입)
+
+render/svo/SVOScene.swift
+
+struct SVOScene {
+    nodes: EngineBuffer<Node>           // 옥트리 노드 배열
+    leaves: EngineBuffer<Leaf>          // 리프 인덱싱
+    leafAlbedo: EngineBuffer<UInt32>    // 패킹된 albedo/opacity/metalness/roughness/emissive
+    leafNormal: EngineBuffer<UInt32>    // 선택사항: 패킹된 양방향/평균 법선
+    mipOffsets: EngineBuffer<Int>       // 콘 트레이싱을 위한 MIP 체인
+    levelInfo: EngineBuffer<LevelInfo>
+    nodeCount, leafCount, levels, resolution: Int
+    doubleBuffered: Bool                // 빌드-렌더 이중 버퍼링
+}
+
+render/svo/SVOBuildSystems.swift
+
+BuildSVOSystem(world: World) -> SVOScene
+BuildSVOMipsSystem(world: World, scene: inout SVOScene)
+LightInjectionSystem(world: World, scene: inout SVOScene)
+
+render/svogi/SVOGISystems.swift
+
+SVOGIConeTraceSystem(world: World, scene: SVOScene, gbuffer: GBufferTargets)
+
+render/passes/GBufferSVOPass.swift
+
+GBufferSVOPass(world: World, scene: SVOScene) -> GBufferTargets
+
+render/passes/ReflectionPass.swift
+
+ReflectionPass(world: World, scene: SVOScene, gbuffer: GBufferTargets)
+
+render/passes/TransparentPass.swift
+
+TransparentPass(world: World, scene: SVOScene, gbuffer: GBufferTargets)
+
+render/passes/ShadowPass.swift
+
+ShadowPass(world: World, scene: SVOScene, gbuffer: GBufferTargets)
+
+메모리 통합은 이미 Allocator.swift, BinnedAllocator.swift, LargeAllocator.swift, Arena.swift에서 제공됩니다
+
+기존 메모리 시스템과의 통합
+
+영구 스토리지:
+
+내부적으로 밀집 배열에 EngineBuffer<T> 사용. EngineBuffer는 이미 작은 것은 BinnedAllocator로, >4KB는 LargeAllocator로 라우팅합니다. SoA 버퍼에서 캐시 라인 정렬을 위해 alignment = max(64, MemoryLayout<T>.alignment)를 지정합니다.
+PackedSparseSet의 메타데이터 (카운트, 용량, < 4KB 단순 배열)는 자연스럽게 BinnedAllocator를 통과합니다.
+SVOScene 및 SVOGIState (대용량 버퍼, MB~수백 MB): EngineBuffer를 통해 LargeAllocator 사용. TLB 감소를 위해 Linux에서 vmAdviseHuge(region, enable: true) 고려.
+
+프레임 임시 데이터:
+
+다음을 위해 FrameArena 사용:
+
+쿼리 교집합 및 임시 리스트
+프레임당 뷰 재구축 (밀집 인덱스 배열)
+SVO 빌드 스크래치 버퍼 (삽입 버퍼, 리프 임시 리스트, 정렬 배열)
+레이 마칭을 위한 타일 후보 리스트
+
+world.endFrame():
+
+BinnedAllocator.shared.flushTLS()
+frameArena.endFrame()
+
+대용량 CPU 작업 세트 (SVO 빌드/밉 생성):
+
+저렴하게 리셋되도록 FrameArena에서 큰 프레임당 배열 할당; 핫 패스에서 ARC 컨테이너 회피.
+SVOScene 이중 버퍼: buildBuffer (쓰기) 및 renderBuffer (읽기) 스왑.
+
+SVOGI + 레이 마칭에 맞춰 조정된 컴포넌트, 시스템, 쿼리
+
+컴포넌트 (POD만; ARC 멤버 없음):
+
+Transform: position (SIMD3<Float>), rotation (simd_quatf), scale (SIMD3<Float>). 크기 ~48–64B.
+  - AoS로 시작; 프로파일링이 요구하는 경우에만 Position/Rotation/Scale SoA로 분할.
+MaterialPBR: baseColor (SIMD3<Float>), emissive (SIMD3<Float>), roughness (Float), metalness (Float), opacity (Float).
+  - 복셀화는 albedo/opacity/metalness/roughness/emissive를 UInt32 또는 패킹된 형식으로 패킹합니다.
+TagRenderable: 빈 구조체 (태그).
+TagVoxelizable: 빈 구조체 (SVO 복셀화를 위한 표시).
+TagDynamic: 빈 구조체 (자주 변경됨, 점진적 재복셀화 후보).
+BoundsAABB: min (SIMD3<Float>), max (SIMD3<Float>) 또는 BoundsSphere { center: SIMD3<Float>, radius: Float }
+  - 거친 컬링 및 보수적 SVO 바운드를 위해.
+MeshRef: id (UInt32) - 메시 핸들 (별도 리소스의 실제 정점/인덱스).
+LightDirectional: direction (SIMD3<Float>), color (SIMD3<Float>), intensity (Float).
+LightPoint: position (SIMD3<Float>), color (SIMD3<Float>), intensity (Float), range (Float).
+LightSpot: position (SIMD3<Float>), direction (SIMD3<Float>), color (SIMD3<Float>), intensity (Float), innerAngle (Float), outerAngle (Float), range (Float).
+VoxelizeDirty: 빈 구조체 (변경 추적을 위한 태그).
+Transparent: ior (Float), absorption (SIMD3<Float>) - 굴절/Beer의 법칙 매개변수.
+선택사항 (레거시): SDFSphere { radius: Float }, SDFBox { halfExtents: SIMD3<Float>, round: Float }, SDFCapsule { … }
+  - 필요한 경우 SVO로 복셀화 가능 (암시적→복셀).
+
+가이드라인: 다형성 회피. 각 컴포넌트 타입은 자체 스토리지(SoA)를 가집니다. 시스템은 타입별 루프를 수행합니다.
+
+시스템:
+
+TransformSystem (선택적 계층): 부모가 있는 경우 월드 변환 사전 계산. 핫 루프를 단순하게 유지하기 위해 Transform에 최종 변환만 저장.
+BoundsSystem: Transform + mesh/SDF 매개변수에서 BoundsAABB 또는 BoundsSphere 계산/업데이트 (SoA, 스트라이드).
+ChangeTrackingSystem:
+  - Transform/Material 변경 시 VoxelizeDirty 표시.
+  - 단순 태그 기반 접근 (초기에 복잡한 틱 시스템 없음).
+BuildSVOSystem:
+  - 입력: VoxelizeView (Renderable + Voxelizable + Transform + MaterialPBR ± MeshRef/SDF*)
+  - 정책:
+    - 더티 카운트/비율이 임계값 미만인 경우: 점진적 업데이트 (더티 리프만 재복셀화).
+    - 임계값 초과 시: 전체 재구축 (빠른 경로, 이중 버퍼).
+  - 출력: LargeAllocator를 통해 노드, 리프, 리프 속성을 가진 SVOScene.
+  - 스크래치: 삽입 버퍼, 리프 임시 리스트, 정렬 배열을 위한 FrameArena.
+BuildSVOMipsSystem:
+  - 콘 트레이싱을 위해 SVO 리프/브릭을 하위 밉으로 집계 (Level-of-Detail).
+LightInjectionSystem:
+  - LightView (Directional/Point/Spot)를 순회하고 SVO로 radiance 주입 (Direct), 선택적 다중 바운스 워밍업.
+GBufferSVOPass:
+  - 주요 가시성을 위한 SVO-DDA → G-Buffer (Normal, Material ID, Depth).
+SVOGIConeTraceSystem:
+  - G-Buffer 기반 콘 트레이싱, AO/간접 조명 계산 (radiance/법선 밉 사용).
+ReflectionPass:
+  - 거울: SVO-DDA 레이 마칭 (1–2 바운스 제한).
+  - 광택: 거칠기 기반 콘 트레이싱.
+TransparentPass:
+  - 굴절 벡터 계산, SVO-DDA 레이 마칭, Beer의 법칙 감쇠.
+ShadowPass:
+  - 광원을 향해 SVO-DDA 레이 마칭, 조기 종료; 콘 근사를 통한 소프트 섀도우.
+
+쿼리:
+
+일반적인 교집합을 위한 캐시된 "뷰" 사용. 예시:
+  - VoxelizeView: Renderable + Voxelizable + Transform + MaterialPBR (± MeshRef/SDF*)
+  - DynamicVoxelizeView: 위 + TagDynamic
+  - LightView (타입별): LightDirectional/Point/Spot
+  - TransparentView: Renderable + Transparent + Transform + MaterialPBR
+
+각 스토리지는 denseEntities 배열을 가집니다. 가장 작은 밀집 세트(예: voxelizable)를 선택하고 sparse 인덱스를 통해 다른 것들의 멤버십을 확인하여 교집합을 구축합니다.
+같은 프레임에서 재사용하기 위해 World에 이러한 엔티티 리스트 (EngineBuffer<Int32>)를 캐시합니다. 관련된 스토리지 중 하나에서 추가/제거 시 더티로 표시합니다.
+
+
+Ikyo + Swift + SVOGI + 레이 마칭에 특화된 성능 크리티컬 고려사항
+
+ARC 및 existential 회피:
+
+모든 컴포넌트는 POD 구조체입니다. 핫 루프에서 캡처된 클래스 참조나 클로저 없음.
+핫 패스에서 프로토콜 Component나 System 없음. 구체적인 타입에 대한 제네릭 함수 사용.
+
+단형 핫 루프 선호:
+
+복셀화/트레이싱을 위한 컴포넌트 타입별 별도 루프; 루프 내부에서 요소별 스위치 없음.
+특수화를 위한 타이트 루프 및 접근자에 @inlinable 및 @inline(__always).
+
+SoA 및 정렬:
+
+밀집 배열에 대해 정렬 >= 64인 EngineBuffer 사용.
+transforms/materials의 경우, 컴포넌트 자체가 AoS 레코드입니다; 함께 접근하는 경우 괜찮습니다. 개별 필드를 독립적으로 접근하는 경우, 별도의 SoA 스토리지로 분할합니다 (예: Position, Rotation, Scale). AoS Transform으로 시작하고 프로파일링이 요구하는 경우에만 분할합니다.
+
+바운드 우선:
+
+각 인스턴스에 대해 BoundsAABB 또는 BoundsSphere 유지; 트레이싱 중 바운드를 테스트하여 레이당 후보 세트를 조기에 생성합니다.
+SVO 순회도 빠른 거부를 위해 childMask를 사용합니다.
+
+메모리/도구 통합:
+
+프레임 종료: FrameArena.reset + BinnedAllocator.flushTLS
+EngineBuffer 클린 해제는 정확한 크기로 할당자를 통과합니다.
+매우 큰 읽기 전용 배열(예: SVO 노드/리프 버퍼)의 경우, TLB 미스를 줄이기 위해 Linux에서 vmAdviseHuge(region, enable: true)를 고려합니다 (선택사항).
+
+Swift 마이크로 최적화:
+
+루프에서 바운드 체크를 제거하기 위해 withUnsafeMutableBufferPointer 접근.
+정말 핫한 경우 for-in보다 포인터 증가가 있는 while 루프 선호.
+타이트 루프에서 클로저 캡처 회피; 수동 루프 함수 제공.
+크로스 파일 인라이닝을 위해 스토리지와 world final 및 internal 함수를 @inlinable로 표시 (모놀리식이므로).
+
+스레딩:
+
+스레드 전체에서 공간 영역/노드 범위별로 SVO 빌드를 분할하고, 각 스레드는 자체 FrameArena 하위 할당에 쓰기 (또는 출력 배열을 사전 슬라이스). 후에 범위를 연결합니다.
+분할 없이 EngineBuffer를 스레드 간에 가변적으로 공유하지 않도록 주의합니다. 타일당 콘 트레이싱은 자명하게 병렬화 가능합니다.
+
+SVO 특화:
+
+트레이싱 루프에서 대역폭을 줄이기 위해 리프 albedo/normal/radiance를 패킹합니다 (예: 패킹된 RGBA16F 또는 10비트 형식을 UInt32로).
+모든 임시 배열 및 후보 리스트에 FrameArena 사용; ARC 없음, retain/release 없음.
+다음에 @inlinable 및 @inline(__always) 적용:
+  - PackedSparseSet.getPtr/add/remove/has
+  - 쿼리 빌더
+  - SVO-DDA 순회 및 거리/콘 평가자
+
+핵심 구조체 및 API (간결한 스케치)
+
+ecs/Entity.swift
+struct Entity { var raw: UInt32 } // 24비트 인덱스, 8비트 gen
+@inline(__always) func entityIndex(_ e: Entity) -> Int { Int(e.raw & 0x00FF_FFFF) }
+@inline(__always) func entityGen(_ e: Entity) -> UInt8 { UInt8((e.raw >> 24) & 0xFF) }
+
+final class EntityManager {
+    private var generations: EngineBuffer<UInt8>
+    private var freeList: [UInt32] = []
+    private(set) var capacity: Int
+    init(initial: Int = 8192) { ... generations를 EngineBuffer를 통해 할당 ... }
+    func create() -> Entity { ... }
+    func destroy(_ e: Entity) { ... gen 증가, 인덱스를 freeList에 푸시 ... }
+    @inline(__always) func alive(_ e: Entity) -> Bool { generations[eIndex] == eGen }
+}
+
+ecs/storage/PackedSparseSet.swift
+struct PackedSparseSet<T> {
+    // SoA: 밀집 값 및 밀집->엔티티 매핑
+    private var values: EngineBuffer<T>
+    private var entities: EngineBuffer<Entity>
+    // sparse는 entityIndex -> denseIndex+1을 매핑 (0은 비어있음을 의미), 배열을 작고 브랜치리스하게 유지
+    private var sparse: EngineBuffer<Int32>
+    private(set) var count: Int
+    private var capacity: Int
+
+    init(initialCapacity: Int = 1024, align: Int = 64) { ... values = EngineBuffer(count: initialCapacity, alignment: align) ... }
+    mutating func ensureCapacity(_ n: Int) { ... EngineBuffer를 통해 LargeAllocator를 사용하여 세 개의 버퍼(values/entities/sparse) 모두 증가 ... }
+    @inline(__always) func has(_ e: Entity) -> Bool { let i = entityIndex(e); return i < sparse.count && sparse[i] != 0 }
+    @inline(__always) mutating func add(_ e: Entity, _ v: T) { ... 밀집으로 뒤로 푸시; sparse[entityIndex]=denseIndex+1 업데이트 }
+    @inline(__always) mutating func remove(_ e: Entity) { ... 밀집에서 스왑-제거; sparse 업데이트; entities[] 유지 }
+    @inline(__always) func getPtr(_ e: Entity) -> UnsafeMutablePointer<T>? { ... return &values.bufferPointer[denseIndex] }
+    @inline(__always) func forEach(_ body: (UnsafeMutablePointer<T>, Entity) -> Void) { // 단형 루프
+        let vp = values.bufferPointer
+        let ep = entities.bufferPointer
+        var i = 0
+        while i < count {
+            body(vp.advanced(by: i), ep.advanced(by: i).pointee)
+            i &+= 1
+        }
+    }
+}
+
+ecs/World.swift
+struct Transform { var pos: SIMD3<Float>; var rot: simd_quatf; var scl: SIMD3<Float> }
+struct MaterialPBR { var base: SIMD3<Float>; var emissive: SIMD3<Float>; var roughness: Float; var metalness: Float; var opacity: Float }
+struct TagRenderable {}
+struct TagVoxelizable {}
+struct TagDynamic {}
+struct VoxelizeDirty {}
+struct BoundsAABB { var min: SIMD3<Float>; var max: SIMD3<Float> }
+struct MeshRef { var id: UInt32 }
+struct LightDirectional { var dir: SIMD3<Float>; var color: SIMD3<Float>; var intensity: Float }
+struct LightPoint { var pos: SIMD3<Float>; var color: SIMD3<Float>; var intensity: Float; var range: Float }
+struct LightSpot { var pos: SIMD3<Float>; var dir: SIMD3<Float>; var color: SIMD3<Float>; var intensity: Float; var inner: Float; var outer: Float; var range: Float }
+struct Transparent { var ior: Float; var absorption: SIMD3<Float> }
+// 선택적 레거시 SDF
+struct SDFSphere { var radius: Float }
+struct SDFBox { var halfExtents: SIMD3<Float>; var round: Float }
+
+struct VoxelizeView { var indices: EngineBuffer<Int32> } // voxelizable 스토리지로의 밀집 인덱스; 아레나에서 프레임당 구축
+struct DynamicVoxelizeView { var indices: EngineBuffer<Int32> }
+struct LightViewDirectional { var indices: EngineBuffer<Int32> }
+// Point/Spot에 대해서도 유사하게
+
+final class World {
+    let entities = EntityManager(initial: 65536)
+    var transforms = PackedSparseSet<Transform>()
+    var materials = PackedSparseSet<MaterialPBR>()
+    var renderable = PackedSparseSet<TagRenderable>()
+    var voxelizable = PackedSparseSet<TagVoxelizable>()
+    var bounds = PackedSparseSet<BoundsAABB>()
+    var meshRef = PackedSparseSet<MeshRef>()
+    var transparent = PackedSparseSet<Transparent>()
+    var lightDirectional = PackedSparseSet<LightDirectional>()
+    var lightPoint = PackedSparseSet<LightPoint>()
+    var lightSpot = PackedSparseSet<LightSpot>()
+    var voxelizeDirty = PackedSparseSet<VoxelizeDirty>()
+    var tagDynamic = PackedSparseSet<TagDynamic>()
+    // 선택적 레거시 SDF
+    var sdfSphere = PackedSparseSet<SDFSphere>()
+    var sdfBox = PackedSparseSet<SDFBox>()
+
+    // 캐시된 뷰 (FrameArena로 프레임당 재생성되거나 더티로 표시)
+    var viewVoxelizeCountDirty = true
+    var viewDynamicVoxelizeCountDirty = true
+    var viewLightsDirectionalCountDirty = true
+    // ... 등
+
+    // 프레임당 아레나
+    private let frameArena = FrameArena(reserveSize: 64 * 1024 * 1024)!
+
+    // SVO 리소스
+    var svoScene: SVOScene
+    var svogi: SVOGIState
+    var gbuffer: GBufferTargets
+
+    func beginFrame() { /* 구조적 변경을 지연 추적하는 경우 뷰를 더티로 표시 */ }
+    func endFrame() {
+        BinnedAllocator.shared.flushTLS()
+        frameArena.endFrame()
+    }
+    func arena() -> FrameArena { frameArena }
+}
+
+ecs/Query.swift
+@inline(__always)
+func buildVoxelizeView(world: World, arena: FrameArena) -> VoxelizeView {
+    let srcCount = world.voxelizable.count
+    let out = EngineBuffer<Int32>(count: srcCount, alignment: 64, allocator: IkyoAlloc.global)!
+    let outPtr = out.bufferPointer
+    let entPtr = world.voxelizable.entities.bufferPointer
+    var outCount = 0
+    var i = 0
+    while i < srcCount {
+        let e = entPtr.advanced(by: i).pointee
+        if world.renderable.has(e) && world.transforms.has(e) && world.materials.has(e) {
+            outPtr.advanced(by: outCount).pointee = Int32(i)
+            outCount &+= 1
+        }
+        i &+= 1
+    }
+    // 필요한 경우 축소 (선택사항) 또는 별도로 카운트 저장
+    return VoxelizeView(indices: out /* 원하는 경우 카운트를 별도로 보관 */)
+}
+
+render/svo/SVOScene.swift
+struct Node {
+    var childMask: UInt8      // 8개의 자식을 위한 8비트 마스크
+    var firstChild: UInt32    // 첫 번째 자식을 위한 nodes 배열로의 인덱스
+}
+struct Leaf {
+    var colorIdx: UInt32      // leafAlbedo로의 인덱스
+    var normalIdx: UInt32     // leafNormal로의 인덱스
+    var opacity: UInt16
+    var flags: UInt16
+}
+struct LevelInfo {
+    var offset: Int
+    var count: Int
+}
+struct SVOScene {
+    var nodes: EngineBuffer<Node>
+    var leaves: EngineBuffer<Leaf>
+    var leafAlbedo: EngineBuffer<UInt32>   // 패킹된 albedo/opacity/metalness/roughness/emissive
+    var leafNormal: EngineBuffer<UInt32>   // 패킹된 양방향/평균 법선
+    var mipOffsets: EngineBuffer<Int>
+    var levelInfo: EngineBuffer<LevelInfo>
+    var nodeCount: Int
+    var leafCount: Int
+    var levels: Int
+    var resolution: Int
+    var doubleBuffered: Bool
+}
+
+render/svo/SVOBuildSystems.swift
+func buildSVOSystem(world: World) -> SVOScene {
+    let arena = world.arena()
+    // 복셀화 뷰 구축
+    let view = buildVoxelizeView(world: world, arena: arena)
+
+    // SVO 버퍼 할당 (EngineBuffer를 통한 LargeAllocator)
+    // ... 복셀화 로직 (mesh/SDF를 점유 그리드로 변환, 옥트리 구축) ...
+    // ... 스크래치 버퍼에 FrameArena 사용 ...
+
+    // 채워진 SVOScene 반환
+    return SVOScene(
+        nodes: nodes,
+        leaves: leaves,
+        leafAlbedo: albedo,
+        leafNormal: normals,
+        mipOffsets: mipOffsets,
+        levelInfo: levelInfo,
+        nodeCount: nodeCount,
+        leafCount: leafCount,
+        levels: levels,
+        resolution: resolution,
+        doubleBuffered: true
+    )
+}
+
+func buildSVOMipsSystem(world: World, scene: inout SVOScene) {
+    // 콘 트레이싱을 위해 리프/브릭을 하위 밉으로 집계 (Level-of-Detail)
+    // ... 구현 ...
+}
+
+func lightInjectionSystem(world: World, scene: inout SVOScene) {
+    // 라이트 뷰를 순회하고 SVO로 radiance 주입
+    let lightDirView = buildLightDirectionalView(world: world, arena: world.arena())
+    // ... SVO로 직접광 주입 ...
+}
+
+render/svogi/SVOGISystems.swift
+struct SVOGIState {
+    var radiance: EngineBuffer<UInt32>  // 리프/브릭당 radiance (또는 밉 레벨당)
+    var temporalHistory: EngineBuffer<UInt32>?  // 선택사항: 이전 프레임 누적/재투영
+    var coneParams: ConeParams
+}
+
+struct ConeParams {
+    var numCones: Int
+    var angles: [Float]
+    var steps: [Int]
+    // ... 등
+}
+
+func svogiConeTraceSystem(world: World, scene: SVOScene, gbuffer: GBufferTargets) {
+    // G-Buffer 기반 콘 트레이싱, AO/간접 조명 계산
+    // radiance/법선 밉 사용
+    // ... 구현 ...
+}
+
+render/passes/GBufferSVOPass.swift
+struct GBufferTargets {
+    var normal: /* 핸들/포인터 */
+    var materialID: /* 핸들/포인터 */
+    var depth: /* 핸들/포인터 */
+}
+
+func gBufferSVOPass(world: World, scene: SVOScene) -> GBufferTargets {
+    // 주요 가시성을 위한 SVO-DDA → G-Buffer (Normal, Material ID, Depth)
+    // ... 구현 ...
+    return GBufferTargets(...)
+}
+
+render/passes/ReflectionPass.swift
+func reflectionPass(world: World, scene: SVOScene, gbuffer: GBufferTargets) {
+    // 거울: SVO-DDA 레이 마칭 (1–2 바운스 제한)
+    // 광택: 거칠기 기반 콘 트레이싱
+    // ... 구현 ...
+}
+
+render/passes/TransparentPass.swift
+func transparentPass(world: World, scene: SVOScene, gbuffer: GBufferTargets) {
+    // 굴절 벡터 계산, SVO-DDA 레이 마칭, Beer의 법칙 감쇠
+    let view = buildTransparentView(world: world, arena: world.arena())
+    // ... 구현 ...
+}
+
+render/passes/ShadowPass.swift
+func shadowPass(world: World, scene: SVOScene, gbuffer: GBufferTargets) {
+    // 광원을 향해 SVO-DDA 레이 마칭, 조기 종료
+    // 콘 근사를 통한 소프트 섀도우
+    // ... 구현 ...
+}
+
+SVOGI + SVO-DDA 경로에 대한 성능 노트
+
+컴포넌트 타입별로 그룹화하고 타입 특화 루프를 실행합니다. 이는 런타임 스위칭을 피하고 분기 예측을 향상시킵니다.
+레이당 후보 리스트를 작게 유지:
+
+픽셀 타일 또는 레이 패킷당 후보를 사전 선택하기 위해 BoundsAABB/BoundsSphere와 SVO 계층 (childMask) 사용.
+
+변환을 최소한으로 평가:
+
+빌드 시 SVO에 변환을 베이크하거나 (정적 지오메트리에 선호), 변환을 별도로 유지하되 연속적으로 유지하고 프리페치합니다.
+
+데이터를 핫하고 패킹되게 유지:
+
+트레이싱 루프에서 대역폭을 줄이기 위해 리프 albedo/normal/radiance 데이터를 타이트하게 패킹합니다 (예: 패킹된 RGBA16F 또는 10비트 형식을 UInt32로).
+
+모든 임시 배열 및 후보 리스트에 FrameArena 사용; ARC 없음, retain/release 없음.
+다음에 @inlinable 및 @inline(__always) 적용:
+
+PackedSparseSet.getPtr/add/remove/has
+쿼리 빌더
+각 컴포넌트 타입에 대한 SVO-DDA 순회 및 콘 평가자
+
+SVO 메모리 관리:
+
+SVOScene 및 SVOGIState는 LargeAllocator 사용 (MB~수백 MB).
+TLB 감소를 위해 Linux에서 vmAdviseHuge(region, enable: true) 고려.
+이중 버퍼: 점진적 재구축 중 읽기-쓰기 충돌을 피하기 위해 buildBuffer (쓰기) 및 renderBuffer (읽기) 스왑.
+
+점진적 복셀화:
+
+더티 엔티티 추적 (VoxelizeDirty 태그).
+더티 카운트/비율이 임계값 미만인 경우 (예: 5–10%): 더티 리프만 재복셀화.
+임계값 초과 시: 전체 재구축 (빠른 경로).
+
+스레딩:
+
+스레드 전체에서 공간 영역/노드 범위별로 SVO 빌드를 분할.
+각 스레드는 자체 FrameArena 하위 슬라이스를 사용.
+후에 범위를 연결.
+타일당 콘 트레이싱은 자명하게 병렬화 가능.
+
+이것이 Ikyo의 철학에 맞는 이유
+
+모놀리식이고 명시적: World는 엔진이 사용하는 컴포넌트를 위한 구체적인 스토리지를 소유합니다. 플러그인 레지스트리나 리플렉션 없음.
+기존 할당자를 종단 간 사용:
+
+EngineBuffer는 자동으로 Binned/Large로 라우팅; 프레임당은 FrameArena.
+핫 패스에서 Foundation 컨테이너 없음.
+
+DOD 우선:
+
+SoA 배열, 캐시 정렬, 포인터 기반 반복.
+쿼리는 렌더 프레임에서 해싱 없이 밀집 인덱스 리스트를 반환.
+
+Swift 함정 회피:
+
+핫 루프에서 프로토콜 existential 없음, ARC 없음, 동적 디스패치 없음, 최소한의 클로저.
+
+SVOGI + SVO-DDA 최적화:
+
+고정된 컴포넌트 조합 (Voxelizable, Lights, Transparent)은 sparse-set + 캐시된 뷰에 완벽하게 맞습니다.
+SVO 빌드/밉/콘 트레이싱 단계는 뷰를 통해 ECS와 깔끔하게 통합됩니다.
+점진적 재복셀화는 변경 추적 (VoxelizeDirty)을 활용합니다.
+
+다음 단계 및 점진적 전달
+
+위와 같이 EntityManager 및 PackedSparseSet 구현 (먼저 단일 파일).
+컴포넌트 추가: Transform, MaterialPBR, TagVoxelizable, Lights, Transparent, BoundsAABB, MeshRef, VoxelizeDirty.
+FrameArena를 사용하여 buildVoxelizeView, buildDynamicVoxelizeView, buildLightViews 구현.
+프레임 아레나 리셋 및 BinnedAllocator.flushTLS()로 world.beginFrame/world.endFrame 통합.
+SVOScene/SVOGIState 구조체 및 LargeAllocator 기반 버퍼 생성 구현.
+BuildSVOSystem/BuildSVOMipsSystem/LightInjectionSystem 구현.
+GBufferSVOPass/SVOGIConeTraceSystem/ReflectionPass/TransparentPass/ShadowPass 구현.
+프로파일: Transform 접근이 지배적인 경우, 필요한 경우에만 Transform을 Position/Rotation/Scale SoA 스토리지로 분할.
+
+이 설계는 SVOGI + SVO-DDA 레이 마칭을 위한 높은 처리량, 캐시 친화적 반복을 제공하고, 할당자를 직접 활용하며, 모놀리식을 유지하고, 핫 패스에서 런타임 비용을 피하기 위해 Swift 제네릭을 사용합니다. 아키텍처는 원래 설계의 강점을 유지하면서 새로운 렌더링 파이프라인(SVOGI 콘 트레이싱 + SVO-DDA 레이 마칭)에 최적화되어 있습니다.
