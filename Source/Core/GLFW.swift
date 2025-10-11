@@ -1,6 +1,6 @@
 import CGLFW
 
-class ikyoWindow {
+class Window {
   private let width: Int32
   private let height: Int32
   private let windowName: String

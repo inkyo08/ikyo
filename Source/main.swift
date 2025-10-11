@@ -13,11 +13,11 @@ final class GameLoop {
   let windowWidth: Int32 = 800
   let windowHeight: Int32 = 600
   
-  private var window: ikyoWindow?
+  private var window: Window?
 
   // MARK: - Initialize
   func initialize() {
-    window = ikyoWindow(w: windowWidth, h: windowHeight, name: "Ikyo")
+    window = Window(w: windowWidth, h: windowHeight, name: "Ikyo")
   }
 
   // MARK: - Update

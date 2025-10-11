@@ -1,0 +1,1277 @@
+Ikyo 게임 엔진 ECS 아키텍처 가이드
+=======================================
+
+이 문서는 Ikyo 게임 엔진을 위한 ECS (Entity Component System) 설계를 쉽게 설명합니다.
+
+## 1. ECS가 뭔가요?
+
+ECS는 게임 오브젝트를 관리하는 방법입니다:
+- **Entity (엔티티)**: 게임 오브젝트의 고유 ID (예: 캐릭터, 적, 총알)
+- **Component (컴포넌트)**: 데이터 (예: 위치, 색상, 체력)
+- **System (시스템)**: 로직 (예: 이동, 렌더링, 충돌)
+
+전통적인 객체지향과 다르게, 데이터와 로직을 분리합니다.
+
+## 2. 왜 이 방식을 선택했나요?
+
+### 2.1 Sparse-Set 방식 선택
+
+**Archetype 방식 대신 Sparse-Set을 선택한 이유:**
+
+Ikyo는 SVOGI (복셀 기반 광선 추적) 렌더러를 사용합니다. 이 렌더러는:
+- 필요한 컴포넌트 조합이 고정적입니다 (Transform + Material + Voxelizable 등)
+- 자주 바뀌는 조합이 적습니다
+- 빠른 추가/삭제가 필요합니다
+
+**Sparse-Set의 장점:**
+- O(1) 시간에 컴포넌트 추가/삭제
+- 메모리를 연속적으로 배치 (캐시 친화적)
+- 컴포넌트 추가/삭제 시 다른 데이터를 옮길 필요 없음
+
+**Archetype의 단점:**
+- 컴포넌트 조합이 바뀔 때마다 메모리를 옮겨야 함
+- 메모리 단편화 발생
+- Ikyo처럼 고정된 시스템에는 불필요한 복잡성
+
+### 2.2 캐시된 뷰 (Cached Views)
+
+자주 사용하는 컴포넌트 조합을 미리 계산해둡니다:
+
+```
+VoxelizeView = Renderable + Voxelizable + Transform + Material
+```
+
+매 프레임마다 이 조합을 찾는 대신, 한 번 계산해서 재사용합니다.
+컴포넌트가 추가/삭제될 때만 다시 계산합니다.
+
+## 3. 핵심 구조
+
+### 3.1 Entity (엔티티)
+
+```swift
+struct Entity {
+    var raw: UInt32  // 32비트 ID
+}
+```
+
+**구조:**
+- 하위 24비트: 엔티티 인덱스 (0 ~ 16,777,215)
+- 상위 8비트: 세대 번호 (0 ~ 255)
+
+**세대 번호가 필요한 이유:**
+엔티티가 삭제되면 인덱스를 재사용합니다. 세대 번호로 "이 인덱스의 몇 번째 엔티티인지" 추적합니다.
+
+**예시:**
+```
+Entity A (ID: 0x00000005) 생성
+Entity A 삭제
+Entity B가 같은 인덱스 사용 (ID: 0x01000005) <- 세대 번호 1 증가
+```
+
+이렇게 하면 삭제된 엔티티를 참조하는 실수를 방지할 수 있습니다.
+
+### 3.2 ComponentStorage (컴포넌트 저장소)
+
+각 컴포넌트 타입마다 하나의 저장소가 있습니다.
+
+**PackedSparseSet 구조:**
+
+```
+1. dense 배열: 실제 컴포넌트 데이터 (연속 메모리)
+   [Transform1, Transform2, Transform3, ...]
+
+2. denseEntities 배열: 어떤 엔티티의 컴포넌트인지
+   [Entity5, Entity12, Entity3, ...]
+
+3. sparse 배열: 엔티티 -> dense 인덱스 매핑
+   sparse[5] = 0   <- Entity5의 데이터는 dense[0]에 있음
+   sparse[12] = 1  <- Entity12의 데이터는 dense[1]에 있음
+   sparse[3] = 2   <- Entity3의 데이터는 dense[2]에 있음
+```
+
+**작동 방식:**
+
+**추가 (Add):**
+```
+Entity 7에 Transform 추가:
+1. dense 배열 끝에 Transform 추가
+2. denseEntities 끝에 Entity 7 추가
+3. sparse[7] = dense 배열의 마지막 인덱스 + 1
+```
+
+**제거 (Remove):**
+```
+Entity 12 제거:
+1. dense[1]을 dense[마지막]으로 교체 (swap-remove)
+2. denseEntities[1]을 denseEntities[마지막]으로 교체
+3. 교체된 엔티티의 sparse 값 업데이트
+4. sparse[12] = 0 (없음 표시)
+5. 배열 크기 1 감소
+```
+
+**조회 (Has/Get):**
+```
+Entity 5가 Transform을 가지고 있는지:
+1. idx = sparse[5]
+2. idx != 0 이면 있음
+3. 실제 데이터는 dense[idx-1]에 있음
+```
+
+**왜 이렇게 하나요?**
+- dense 배열은 항상 연속적이므로 반복이 빠릅니다 (캐시 히트율 높음)
+- sparse 배열로 O(1) 시간에 "엔티티가 이 컴포넌트를 가지고 있는지" 확인
+- 추가/제거도 O(1) 시간
+
+### 3.3 World (월드)
+
+모든 엔티티와 컴포넌트 저장소를 관리합니다.
+
+```swift
+final class World {
+    // 엔티티 관리자
+    let entities = EntityManager(initial: 65536)
+
+    // 각 컴포넌트 타입별 저장소
+    var transforms = PackedSparseSet<Transform>()
+    var materials = PackedSparseSet<MaterialPBR>()
+    var renderable = PackedSparseSet<TagRenderable>()
+    var voxelizable = PackedSparseSet<TagVoxelizable>()
+    var bounds = PackedSparseSet<BoundsAABB>()
+    var meshRef = PackedSparseSet<MeshRef>()
+    var transparent = PackedSparseSet<Transparent>()
+
+    // 라이트 컴포넌트들
+    var lightDirectional = PackedSparseSet<LightDirectional>()
+    var lightPoint = PackedSparseSet<LightPoint>()
+    var lightSpot = PackedSparseSet<LightSpot>()
+
+    // 상태 추적 컴포넌트들
+    var voxelizeDirty = PackedSparseSet<VoxelizeDirty>()
+    var tagDynamic = PackedSparseSet<TagDynamic>()
+
+    // 레거시 SDF 지원
+    var sdfSphere = PackedSparseSet<SDFSphere>()
+    var sdfBox = PackedSparseSet<SDFBox>()
+
+    // 프레임당 임시 메모리
+    private let frameArena = FrameArena(reserveSize: 64 * 1024 * 1024)!
+
+    // 렌더링 리소스
+    var svoScene: SVOScene
+    var svogi: SVOGIState
+    var gbuffer: GBufferTargets
+}
+```
+
+**모놀리식 철학:**
+- 모든 컴포넌트 타입을 직접 선언
+- 플러그인이나 동적 등록 없음
+- 컴파일 타임에 모든 것이 결정됨
+- Swift의 제네릭으로 최적화 가능
+
+## 4. 컴포넌트 설계
+
+### 4.1 컴포넌트 원칙
+
+**반드시 지켜야 할 규칙:**
+1. POD (Plain Old Data)만 사용
+2. 클래스 참조 금지 (ARC 오버헤드 회피)
+3. 클로저 금지
+4. 프로토콜 금지 (핫 패스에서)
+
+### 4.2 컴포넌트 종류
+
+**공간 컴포넌트:**
+```swift
+// 위치, 회전, 스케일
+struct Transform {
+    var pos: SIMD3<Float>
+    var rot: simd_quatf
+    var scl: SIMD3<Float>
+}
+
+// 바운딩 박스 (컬링용)
+struct BoundsAABB {
+    var min: SIMD3<Float>
+    var max: SIMD3<Float>
+}
+```
+
+**렌더링 컴포넌트:**
+```swift
+// PBR 재질
+struct MaterialPBR {
+    var base: SIMD3<Float>      // 기본 색상
+    var emissive: SIMD3<Float>  // 발광
+    var roughness: Float        // 거칠기
+    var metalness: Float        // 금속성
+    var opacity: Float          // 불투명도
+}
+
+// 메시 참조
+struct MeshRef {
+    var id: UInt32
+}
+
+// 투명 재질
+struct Transparent {
+    var ior: Float                // 굴절률
+    var absorption: SIMD3<Float>  // 흡수율 (Beer's law)
+}
+```
+
+**태그 컴포넌트 (빈 구조체):**
+```swift
+struct TagRenderable {}    // 렌더링 대상
+struct TagVoxelizable {}   // 복셀화 대상
+struct TagDynamic {}       // 자주 변하는 오브젝트
+struct VoxelizeDirty {}    // 복셀화 필요 표시
+```
+
+태그 컴포넌트는 데이터 없이 "표시"만 합니다. 메모리를 거의 사용하지 않습니다.
+
+**라이트 컴포넌트:**
+```swift
+// 방향성 조명 (태양 등)
+struct LightDirectional {
+    var dir: SIMD3<Float>
+    var color: SIMD3<Float>
+    var intensity: Float
+}
+
+// 점 광원
+struct LightPoint {
+    var pos: SIMD3<Float>
+    var color: SIMD3<Float>
+    var intensity: Float
+    var range: Float
+}
+
+// 스포트라이트
+struct LightSpot {
+    var pos: SIMD3<Float>
+    var dir: SIMD3<Float>
+    var color: SIMD3<Float>
+    var intensity: Float
+    var inner: Float    // 내부 각도
+    var outer: Float    // 외부 각도
+    var range: Float
+}
+```
+
+**레거시 SDF 컴포넌트:**
+```swift
+struct SDFSphere {
+    var radius: Float
+}
+
+struct SDFBox {
+    var halfExtents: SIMD3<Float>
+    var round: Float
+}
+```
+
+### 4.3 SoA vs AoS
+
+**AoS (Array of Structures):**
+```
+struct Transform { x, y, z, rx, ry, rz, sx, sy, sz }
+배열: [Transform1, Transform2, Transform3, ...]
+```
+
+**SoA (Structure of Arrays):**
+```
+struct Transforms {
+    positions: [x1, x2, x3, ...]
+    rotations: [rx1, rx2, rx3, ...]
+    scales: [sx1, sx2, sx3, ...]
+}
+```
+
+**현재 설계:**
+- Transform은 AoS (함께 사용하므로)
+- 필요하면 나중에 SoA로 분할 가능
+- 프로파일링 후 결정
+
+## 5. 쿼리 시스템
+
+### 5.1 쿼리란?
+
+"특정 컴포넌트 조합을 가진 모든 엔티티 찾기"
+
+**예시:**
+```
+"Transform과 Material과 Voxelizable을 모두 가진 엔티티들"
+```
+
+### 5.2 쿼리 작동 방식
+
+**기본 알고리즘:**
+```
+1. 가장 작은 집합 선택 (예: voxelizable 컴포넌트)
+2. 그 집합의 모든 엔티티 순회
+3. 각 엔티티가 다른 컴포넌트도 가지고 있는지 확인
+4. 모두 가진 엔티티만 결과에 추가
+```
+
+**코드로 보기:**
+```swift
+func buildVoxelizeView(world: World) -> VoxelizeView {
+    // voxelizable은 가장 작은 집합이라고 가정
+    let srcCount = world.voxelizable.count
+    let out = EngineBuffer<Int32>(count: srcCount)
+    var outCount = 0
+
+    // voxelizable의 모든 엔티티 순회
+    for i in 0..<srcCount {
+        let entity = world.voxelizable.entities[i]
+
+        // 다른 필수 컴포넌트 확인
+        if world.renderable.has(entity) &&
+           world.transforms.has(entity) &&
+           world.materials.has(entity) {
+            out[outCount] = Int32(i)
+            outCount += 1
+        }
+    }
+
+    return VoxelizeView(indices: out, count: outCount)
+}
+```
+
+### 5.3 캐시된 뷰
+
+자주 사용하는 쿼리는 결과를 캐시합니다:
+
+**뷰 종류:**
+```
+VoxelizeView: Renderable + Voxelizable + Transform + Material
+  → 복셀화할 오브젝트들
+
+DynamicVoxelizeView: 위 + TagDynamic
+  → 자주 변하는 오브젝트들 (증분 업데이트용)
+
+LightViewDirectional: LightDirectional 컴포넌트를 가진 엔티티들
+  → 방향성 조명들
+
+TransparentView: Renderable + Transparent + Transform + Material
+  → 투명 오브젝트들
+```
+
+**캐시 무효화:**
+```
+- 컴포넌트 추가/제거 시 viewDirty 플래그 설정
+- 다음 프레임에 뷰 재구축
+- 또는 프레임마다 FrameArena로 재구축
+```
+
+## 6. 메모리 관리
+
+### 6.1 메모리 할당자 3종류
+
+Ikyo는 커스텀 메모리 할당자를 사용합니다:
+
+**1. BinnedAllocator (작은 할당)**
+```
+- 작은 크기 (< 4KB)
+- 빠른 할당/해제
+- 크기별 "빈(bin)"으로 관리
+- 예: 컴포넌트 메타데이터, 작은 배열
+```
+
+**2. LargeAllocator (큰 할당)**
+```
+- 큰 크기 (>= 4KB)
+- 직접 시스템 메모리 할당
+- 예: 컴포넌트 dense 배열, SVO 버퍼
+```
+
+**3. FrameArena (프레임 임시 메모리)**
+```
+- 한 프레임 내에서만 사용
+- 프레임 끝에 한 번에 해제
+- 극도로 빠름 (포인터만 이동)
+- 예: 쿼리 결과, 임시 리스트, 정렬 버퍼
+```
+
+### 6.2 EngineBuffer
+
+모든 배열에 EngineBuffer를 사용합니다:
+
+```swift
+var transforms: EngineBuffer<Transform>
+```
+
+**EngineBuffer가 하는 일:**
+- 크기에 따라 자동으로 적절한 할당자 선택
+- 캐시 정렬 (64바이트)
+- 안전한 해제
+- ARC 없음 (수동 메모리 관리)
+
+### 6.3 메모리 사용 패턴
+
+**영구 데이터:**
+```
+PackedSparseSet의 배열들:
+  - dense: EngineBuffer<T>
+  - denseEntities: EngineBuffer<Entity>
+  - sparse: EngineBuffer<Int32>
+
+→ BinnedAllocator (메타데이터)
+→ LargeAllocator (큰 배열)
+```
+
+**프레임 임시 데이터:**
+```
+쿼리 결과, 임시 리스트:
+  - VoxelizeView의 indices 배열
+  - SVO 빌드 스크래치 버퍼
+  - 타일 후보 리스트
+
+→ FrameArena (프레임 끝에 일괄 해제)
+```
+
+**대용량 렌더링 데이터:**
+```
+SVOScene, SVOGIState:
+  - nodes: EngineBuffer<Node>
+  - leaves: EngineBuffer<Leaf>
+  - leafAlbedo: EngineBuffer<UInt32>
+
+→ LargeAllocator (수백 MB)
+→ Linux에서 vmAdviseHuge로 TLB 최적화
+```
+
+### 6.4 프레임 사이클
+
+```swift
+// 프레임 시작
+world.beginFrame()
+  // 뷰를 더티로 표시 (필요시)
+
+// 프레임 처리
+  // 쿼리 실행 (FrameArena 사용)
+  // 시스템 실행
+  // 렌더링
+
+// 프레임 끝
+world.endFrame()
+  BinnedAllocator.shared.flushTLS()  // TLS 캐시 비우기
+  frameArena.endFrame()              // 프레임 메모리 리셋
+```
+
+## 7. 시스템 설계
+
+시스템은 컴포넌트를 처리하는 일반 함수입니다.
+
+### 7.1 시스템 원칙
+
+1. 프로토콜 System 없음
+2. 각 시스템은 독립 함수
+3. World를 매개변수로 받음
+4. 제네릭 사용으로 단형(monomorphic) 유지
+
+### 7.2 시스템 종류
+
+**변환 시스템:**
+```swift
+func transformSystem(world: World) {
+    // 계층 구조가 있다면 부모-자식 변환 계산
+    // 최종 월드 변환을 Transform에 저장
+}
+```
+
+**바운드 계산 시스템:**
+```swift
+func boundsSystem(world: World) {
+    // Transform + Mesh/SDF에서 BoundsAABB 계산
+    world.transforms.forEach { transform, entity in
+        if let meshRef = world.meshRef.get(entity) {
+            let bounds = calculateBounds(transform, meshRef)
+            world.bounds.add(entity, bounds)
+        }
+    }
+}
+```
+
+**변경 추적 시스템:**
+```swift
+func changeTrackingSystem(world: World) {
+    // Transform이나 Material이 변경되면
+    // VoxelizeDirty 태그 추가
+
+    // 나중에 BuildSVO 시스템이 이 태그를 확인
+}
+```
+
+**SVO 빌드 시스템:**
+```swift
+func buildSVOSystem(world: World) -> SVOScene {
+    // 1. VoxelizeView 생성 (쿼리)
+    let view = buildVoxelizeView(world: world)
+
+    // 2. 더티 비율 확인
+    let dirtyRatio = world.voxelizeDirty.count / view.count
+
+    if dirtyRatio < 0.1 {
+        // 3a. 증분 업데이트 (더티만 재복셀화)
+        updateDirtySVO(world, view)
+    } else {
+        // 3b. 전체 재구축
+        rebuildFullSVO(world, view)
+    }
+
+    // 4. SVOScene 반환
+    return world.svoScene
+}
+```
+
+**SVO 밉맵 시스템:**
+```swift
+func buildSVOMipsSystem(world: World, scene: inout SVOScene) {
+    // 하위 레벨 밉 생성
+    // 레벨 0: 원본 해상도
+    // 레벨 1: 절반 해상도
+    // 레벨 2: 1/4 해상도
+    // ...
+
+    // 콘 트레이싱에서 거리에 따라 적절한 밉 사용
+}
+```
+
+**라이트 주입 시스템:**
+```swift
+func lightInjectionSystem(world: World, scene: inout SVOScene) {
+    // 방향성 조명
+    let dirLights = buildLightDirectionalView(world: world)
+    for lightEntity in dirLights {
+        let light = world.lightDirectional.get(lightEntity)
+        injectDirectionalLight(scene, light)
+    }
+
+    // 점 광원
+    let pointLights = buildLightPointView(world: world)
+    for lightEntity in pointLights {
+        let light = world.lightPoint.get(lightEntity)
+        injectPointLight(scene, light)
+    }
+
+    // 스포트라이트
+    // ...
+}
+```
+
+## 8. 렌더링 파이프라인
+
+Ikyo는 SVOGI (Sparse Voxel Octree Global Illumination) + SVO-DDA 레이 마칭을 사용합니다.
+
+### 8.1 SVO (Sparse Voxel Octree)란?
+
+**옥트리 (Octree):**
+```
+3D 공간을 8개 영역으로 재귀적으로 분할하는 트리 구조
+
+       +-------+
+      /|      /|
+     / |     / |
+    +-------+  |
+    |  |    |  |
+    |  +----|--+
+    | /     | /
+    |/      |/
+    +-------+
+
+각 노드는 8개의 자식을 가짐:
+- 왼쪽 앞 아래
+- 오른쪽 앞 아래
+- 왼쪽 뒤 아래
+- 오른쪽 뒤 아래
+- 왼쪽 앞 위
+- 오른쪽 앞 위
+- 왼쪽 뒤 위
+- 오른쪽 뒤 위
+```
+
+**Sparse (희소):**
+```
+빈 공간은 저장하지 않음
+오직 지오메트리가 있는 영역만 저장
+
+메모리 절약 + 빠른 순회
+```
+
+### 8.2 SVOScene 구조
+
+```swift
+struct SVOScene {
+    // 옥트리 노드
+    var nodes: EngineBuffer<Node>
+
+    // 리프 (말단 노드)
+    var leaves: EngineBuffer<Leaf>
+
+    // 리프 데이터
+    var leafAlbedo: EngineBuffer<UInt32>   // 색상 등
+    var leafNormal: EngineBuffer<UInt32>   // 법선
+
+    // 밉맵 정보
+    var mipOffsets: EngineBuffer<Int>
+    var levelInfo: EngineBuffer<LevelInfo>
+
+    // 통계
+    var nodeCount: Int
+    var leafCount: Int
+    var levels: Int
+    var resolution: Int
+
+    // 이중 버퍼링 (읽기/쓰기 분리)
+    var doubleBuffered: Bool
+}
+```
+
+**Node 구조:**
+```swift
+struct Node {
+    var childMask: UInt8      // 8비트, 각 비트가 자식 존재 여부
+    var firstChild: UInt32    // 첫 번째 자식의 인덱스
+}
+```
+
+**childMask 예시:**
+```
+childMask = 0b10110001
+           = 177
+
+비트 7 (최상위): 1 → 오른쪽 뒤 위 자식 있음
+비트 6:          0 → 왼쪽 뒤 위 자식 없음
+비트 5:          1 → 오른쪽 앞 위 자식 있음
+비트 4:          1 → 왼쪽 앞 위 자식 있음
+비트 3:          0 → 오른쪽 뒤 아래 자식 없음
+비트 2:          0 → 왼쪽 뒤 아래 자식 없음
+비트 1:          0 → 오른쪽 앞 아래 자식 없음
+비트 0:          1 → 왼쪽 앞 아래 자식 있음
+```
+
+### 8.3 렌더링 단계
+
+**1. G-Buffer Pass (SVO-DDA 레이 마칭)**
+```
+각 픽셀에서 광선 발사
+  → SVO를 DDA 알고리즘으로 순회
+  → 첫 번째 충돌 지점 찾기
+  → 법선, 재질 ID, 깊이 기록
+  → G-Buffer에 저장
+```
+
+**2. SVOGI Pass (콘 트레이싱)**
+```
+각 픽셀의 G-Buffer 읽기
+  → 법선 방향으로 콘 발사
+  → SVO 밉맵을 사용해 콘 트레이싱
+  → 간접광 수집
+  → Ambient Occlusion 계산
+```
+
+**3. 반사 Pass**
+
+**거울 반사 (SVO-DDA):**
+```
+반사 벡터 계산
+  → SVO-DDA 레이 마칭
+  → 1-2 바운스 제한
+  → 반사된 색상 반환
+```
+
+**광택 반사 (콘 트레이싱):**
+```
+거칠기에 따라 콘 각도 조정
+  → 거칠기 높음 = 넓은 콘
+  → 거칠기 낮음 = 좁은 콘
+  → 콘 트레이싱으로 반사 근사
+```
+
+**4. 투명/굴절 Pass**
+```
+굴절 벡터 계산 (Snell's law)
+  → SVO-DDA 레이 마칭
+  → Beer's law로 흡수 계산
+  → 복셀 밀도로 볼륨 표현
+```
+
+**5. 그림자 Pass**
+```
+G-Buffer의 각 점에서
+  → 광원을 향해 광선 발사
+  → SVO-DDA 레이 마칭
+  → 첫 충돌에서 조기 종료 (그림자)
+  → 콘 트레이싱으로 소프트 섀도우
+```
+
+### 8.4 SVO-DDA 알고리즘
+
+**DDA (Digital Differential Analyzer):**
+```
+격자를 따라 광선을 효율적으로 순회하는 알고리즘
+
+2D 예시:
+  S = 시작점
+  E = 끝점
+
+  +---+---+---+---+
+  |   |   | X |   |
+  +---+---+---+---+
+  |   | X | X |   |
+  +---+---+---+---+
+  | S | X |   |   |
+  +---+---+---+---+
+
+  X = 광선이 지나가는 셀
+  각 셀을 순서대로 방문
+```
+
+**SVO-DDA:**
+```
+옥트리를 DDA로 순회
+  → 큰 빈 노드는 한 번에 건너뜀
+  → 작은 노드만 세밀하게 확인
+  → 계층적 순회로 빠름
+```
+
+**의사 코드:**
+```
+function svo_dda_raymarch(ray, svo):
+    node = svo.root
+    t = 0  // 광선 파라미터
+
+    while t < max_distance:
+        // 현재 노드 크기 계산
+        size = nodeSize(node)
+
+        // 노드 경계까지의 거리
+        t_exit = rayExitDistance(ray, node, t)
+
+        // 리프 노드면
+        if isLeaf(node):
+            // 충돌 확인
+            if hasGeometry(node):
+                return hit(node, t)
+            // 다음 노드로
+            node = findNextNode(ray, svo, t_exit)
+            t = t_exit
+        else:
+            // 자식 노드로 내려감
+            childIdx = findChildAtPoint(ray, node, t)
+            if childExists(node, childIdx):
+                node = getChild(node, childIdx)
+            else:
+                // 빈 자식, 건너뜀
+                node = findNextNode(ray, svo, t_exit)
+                t = t_exit
+
+    return miss
+```
+
+### 8.5 콘 트레이싱
+
+**콘 (Cone)이란?**
+```
+원뿔 모양의 볼륨
+
+    /|\
+   / | \
+  /  |  \
+ /   |   \
+/____|____\
+
+- 각도: 원뿔의 폭
+- 높이: 추적 거리
+```
+
+**왜 콘을 사용하나요?**
+```
+단일 광선 대신 볼륨을 샘플링
+  → 간접광 수집
+  → Ambient Occlusion
+  → 광택 반사
+
+여러 광선을 발사하는 것보다 빠름
+```
+
+**콘 트레이싱 단계:**
+```
+1. 시작점과 방향 설정
+2. 초기 콘 각도 설정
+3. 단계별로 전진:
+   a. 현재 위치의 SVO 밉 레벨 선택
+      (거리에 따라 낮은 해상도 사용)
+   b. 콘이 덮는 영역의 복셀 샘플링
+   c. Radiance 누적
+   d. 불투명도 누적
+   e. 불투명도 > 임계값이면 종료
+4. 누적된 radiance 반환
+```
+
+**여러 콘 사용:**
+```
+간접광 계산 시 보통 5-9개의 콘 발사:
+
+법선 방향 기준으로:
+  - 중앙 콘
+  - 위 콘
+  - 아래 콘
+  - 왼쪽 콘
+  - 오른쪽 콘
+  - 대각선 콘들
+```
+
+## 9. 성능 최적화
+
+### 9.1 Swift 특화 최적화
+
+**ARC 회피:**
+```swift
+// 나쁨: 클래스 사용 (ARC 오버헤드)
+class Transform {
+    var position: SIMD3<Float>
+}
+
+// 좋음: 구조체 사용 (스택/직접 저장)
+struct Transform {
+    var position: SIMD3<Float>
+}
+```
+
+**프로토콜 Existential 회피:**
+```swift
+// 나쁨: 프로토콜 타입 (동적 디스패치)
+func process(component: Component) {
+    component.update()  // 가상 함수 호출
+}
+
+// 좋음: 제네릭 (정적 디스패치)
+func process<T>(component: T) {
+    component.update()  // 인라인 가능
+}
+```
+
+**인라이닝:**
+```swift
+@inline(__always)
+@inlinable
+func hotFunction() {
+    // 자주 호출되는 함수
+    // 컴파일러가 항상 인라인화
+}
+```
+
+### 9.2 메모리 접근 패턴
+
+**캐시 라인 정렬:**
+```
+CPU 캐시 라인 = 64바이트
+
+EngineBuffer는 64바이트 정렬:
+  → 한 캐시 라인에 여러 요소
+  → False sharing 방지
+```
+
+**순차 접근:**
+```swift
+// 좋음: 순차적 접근 (캐시 친화적)
+for i in 0..<count {
+    process(dense[i])
+}
+
+// 나쁨: 랜덤 접근 (캐시 미스 많음)
+for entity in entities {
+    let idx = sparse[entity.index]
+    process(dense[idx])
+}
+```
+
+**SoA 배치:**
+```
+한 필드만 접근할 때 유리:
+
+AoS: [x1,y1,z1,x2,y2,z2,x3,y3,z3, ...]
+     불필요한 y,z도 캐시에 로드
+
+SoA: positions_x: [x1,x2,x3, ...]
+     필요한 x만 캐시에 로드
+```
+
+### 9.3 SIMD 최적화
+
+```swift
+// SIMD3<Float> 사용
+var position = SIMD3<Float>(x: 1, y: 2, z: 3)
+var velocity = SIMD3<Float>(x: 0.1, y: 0.2, z: 0.3)
+
+// 벡터 연산 (SIMD 명령어 사용)
+position += velocity * deltaTime  // 3개의 곱셈과 덧셈을 한 번에
+```
+
+### 9.4 바운드 컬링
+
+```swift
+// 레이 마칭 전에 바운드 체크
+func raymarch(ray: Ray, world: World) {
+    let view = buildVoxelizeView(world: world)
+
+    for entityIdx in view.indices {
+        let entity = view.entities[entityIdx]
+        let bounds = world.bounds.get(entity)
+
+        // 바운드와 광선 교차 테스트
+        if !intersectRayAABB(ray, bounds) {
+            continue  // 이 엔티티 건너뜀
+        }
+
+        // 실제 SVO 순회
+        marchSVO(ray, entity)
+    }
+}
+```
+
+### 9.5 더티 추적과 증분 업데이트
+
+**전체 재구축 vs 증분 업데이트:**
+```
+더티 비율 < 10%:
+  → 변경된 복셀만 업데이트
+  → 빠름
+
+더티 비율 >= 10%:
+  → 전체 재구축
+  → 더 빠를 수 있음 (오버헤드 적음)
+```
+
+**이중 버퍼링:**
+```
+버퍼 A: 현재 렌더링에 사용
+버퍼 B: 다음 프레임을 위해 빌드
+
+프레임 끝에 스왑:
+  → 렌더링 중 수정 없음
+  → 동시성 안전
+```
+
+### 9.6 스레딩
+
+**공간 분할:**
+```
+SVO를 공간적으로 분할:
+
+스레드 1: 월드의 왼쪽 절반 처리
+스레드 2: 월드의 오른쪽 절반 처리
+
+각 스레드는 독립적인 FrameArena 사용
+  → 락 불필요
+  → 완전 병렬
+```
+
+**타일 기반 렌더링:**
+```
+화면을 타일로 분할:
+
++-----+-----+-----+
+|  1  |  2  |  3  |
++-----+-----+-----+
+|  4  |  5  |  6  |
++-----+-----+-----+
+
+각 타일을 독립적으로 렌더링
+  → 스레드당 하나 이상의 타일
+  → 완전 병렬
+```
+
+### 9.7 데이터 압축
+
+**리프 데이터 패킹:**
+```
+32비트에 여러 값 패킹:
+
+알베도 (RGB): 10비트 + 10비트 + 10비트
+불투명도: 8비트
+러프니스: 4비트
+메탈니스: 4비트
+발광: 여부만 1비트
+
+→ 메모리 대역폭 절감
+→ 캐시 효율 증가
+```
+
+**법선 압축:**
+```
+법선은 단위 벡터:
+  → 2개 값만 저장 (3번째는 계산)
+  → 또는 옥타헤드론 매핑 사용
+  → 32비트에 고품질 법선
+```
+
+## 10. 전체 흐름 예시
+
+### 10.1 게임 오브젝트 생성
+
+```swift
+// 1. 엔티티 생성
+let entity = world.entities.create()
+
+// 2. 컴포넌트 추가
+world.transforms.add(entity, Transform(
+    pos: SIMD3(0, 0, 0),
+    rot: simd_quatf(angle: 0, axis: SIMD3(0, 1, 0)),
+    scl: SIMD3(1, 1, 1)
+))
+
+world.materials.add(entity, MaterialPBR(
+    base: SIMD3(0.8, 0.8, 0.8),
+    emissive: SIMD3(0, 0, 0),
+    roughness: 0.5,
+    metalness: 0.0,
+    opacity: 1.0
+))
+
+world.meshRef.add(entity, MeshRef(id: 42))
+world.renderable.add(entity, TagRenderable())
+world.voxelizable.add(entity, TagVoxelizable())
+
+// 3. 바운드 계산
+let bounds = calculateBounds(mesh: 42)
+world.bounds.add(entity, bounds)
+```
+
+### 10.2 프레임 처리
+
+```swift
+func renderFrame(world: World) {
+    // 1. 프레임 시작
+    world.beginFrame()
+
+    // 2. 시스템 실행
+    transformSystem(world)          // 변환 업데이트
+    boundsSystem(world)             // 바운드 업데이트
+    changeTrackingSystem(world)     // 더티 추적
+
+    // 3. SVO 업데이트 (필요시)
+    if world.svoNeedsUpdate {
+        buildSVOSystem(world)       // SVO 재구축/업데이트
+        buildSVOMipsSystem(world)   // 밉맵 생성
+        lightInjectionSystem(world) // 광원 주입
+    }
+
+    // 4. 렌더링 패스
+    let gbuffer = gBufferSVOPass(world, world.svoScene)
+    svogiConeTraceSystem(world, world.svoScene, gbuffer)
+    reflectionPass(world, world.svoScene, gbuffer)
+    transparentPass(world, world.svoScene, gbuffer)
+    shadowPass(world, world.svoScene, gbuffer)
+
+    // 5. 프레임 끝
+    world.endFrame()
+}
+```
+
+### 10.3 오브젝트 이동
+
+```swift
+func moveObject(world: World, entity: Entity, delta: SIMD3<Float>) {
+    // 1. Transform 가져오기
+    if let transform = world.transforms.getPtr(entity) {
+        // 2. 위치 수정
+        transform.pointee.pos += delta
+
+        // 3. 더티 표시
+        world.voxelizeDirty.add(entity, VoxelizeDirty())
+
+        // 4. 뷰 무효화
+        world.viewVoxelizeCountDirty = true
+    }
+}
+```
+
+### 10.4 오브젝트 삭제
+
+```swift
+func destroyObject(world: World, entity: Entity) {
+    // 1. 모든 컴포넌트 제거
+    world.transforms.remove(entity)
+    world.materials.remove(entity)
+    world.meshRef.remove(entity)
+    world.renderable.remove(entity)
+    world.voxelizable.remove(entity)
+    world.bounds.remove(entity)
+    world.voxelizeDirty.remove(entity)
+
+    // 2. 엔티티 제거
+    world.entities.destroy(entity)
+
+    // 3. 뷰 무효화
+    world.viewVoxelizeCountDirty = true
+}
+```
+
+## 11. 파일 구조
+
+```
+ecs/
+  Entity.swift                     # Entity, EntityManager
+  storage/
+    PackedSparseSet.swift          # 컴포넌트 저장소
+  World.swift                      # 전체 월드
+  Query.swift                      # 쿼리 함수들
+  Systems/
+    TransformSystem.swift          # 변환 시스템
+    BoundsSystem.swift             # 바운드 시스템
+    ChangeTrackingSystem.swift     # 변경 추적
+    BuildSVOSystem.swift           # SVO 빌드
+    BuildSVOMipsSystem.swift       # SVO 밉맵
+    LightInjectionSystem.swift     # 라이트 주입
+
+render/
+  svo/
+    SVOScene.swift                 # SVO 구조체
+    SVOBuildSystems.swift          # SVO 빌드 로직
+  svogi/
+    SVOGIState.swift               # SVOGI 상태
+    SVOGISystems.swift             # SVOGI 콘 트레이싱
+  passes/
+    GBufferSVOPass.swift           # G-Buffer 패스
+    ReflectionPass.swift           # 반사 패스
+    TransparentPass.swift          # 투명 패스
+    ShadowPass.swift               # 그림자 패스
+
+memory/
+  Allocator.swift                  # 기본 할당자 인터페이스
+  BinnedAllocator.swift            # 작은 할당
+  LargeAllocator.swift             # 큰 할당
+  Arena.swift                      # 프레임 아레나
+  EngineBuffer.swift               # 버퍼 래퍼
+```
+
+## 12. 점진적 구현 로드맵
+
+### 단계 1: 기초 ECS
+```
+[ ] Entity, EntityManager 구현
+[ ] PackedSparseSet 구현
+[ ] World 구조 생성
+[ ] 기본 컴포넌트 정의
+```
+
+### 단계 2: 쿼리 시스템
+```
+[ ] 쿼리 함수 구현
+[ ] 캐시된 뷰 구현
+[ ] 더티 추적 구현
+```
+
+### 단계 3: 메모리 통합
+```
+[ ] EngineBuffer 통합
+[ ] FrameArena 사용
+[ ] beginFrame/endFrame 구현
+```
+
+### 단계 4: 기본 시스템
+```
+[ ] TransformSystem
+[ ] BoundsSystem
+[ ] ChangeTrackingSystem
+```
+
+### 단계 5: SVO 기초
+```
+[ ] SVOScene 구조체
+[ ] 간단한 SVO 빌드
+[ ] SVO 순회 테스트
+```
+
+### 단계 6: SVO-DDA
+```
+[ ] DDA 알고리즘 구현
+[ ] SVO-DDA 통합
+[ ] G-Buffer 패스
+```
+
+### 단계 7: SVOGI
+```
+[ ] 밉맵 생성
+[ ] 콘 트레이싱 구현
+[ ] 간접광 계산
+```
+
+### 단계 8: 고급 기능
+```
+[ ] 반사 패스
+[ ] 투명 패스
+[ ] 그림자 패스
+[ ] 증분 업데이트
+```
+
+### 단계 9: 최적화
+```
+[ ] 프로파일링
+[ ] 병렬화
+[ ] 데이터 압축
+[ ] SoA 분할 (필요시)
+```
+
+## 13. 핵심 개념 요약
+
+### ECS 설계
+- **Sparse-Set**: O(1) 추가/제거, 연속 메모리
+- **캐시된 뷰**: 자주 쓰는 쿼리 결과 저장
+- **모놀리식**: 모든 컴포넌트 타입 명시적 선언
+
+### 메모리 관리
+- **BinnedAllocator**: 작은 할당 (< 4KB)
+- **LargeAllocator**: 큰 할당 (>= 4KB)
+- **FrameArena**: 프레임 임시 메모리
+
+### 렌더링
+- **SVO**: 희소 복셀 옥트리
+- **SVO-DDA**: 효율적인 옥트리 순회
+- **콘 트레이싱**: 간접광, AO, 광택 반사
+- **이중 버퍼링**: 렌더링 중 안전한 업데이트
+
+### 성능
+- **ARC 회피**: 구조체 사용
+- **인라이닝**: 핫 함수 최적화
+- **캐시 정렬**: 64바이트 정렬
+- **SIMD**: 벡터 연산
+- **스레딩**: 공간/타일 기반 병렬화
+
+### 철학
+- **명시적**: 모든 것이 명확함
+- **제어**: 세밀한 메모리 제어
+- **성능**: 최적화가 최우선
+- **단순함**: 불필요한 추상화 제거
+
+## 14. 추가 참고 자료
+
+### Swift 성능
+- `@inlinable`, `@inline(__always)` 사용법
+- ARC와 참조 카운팅 이해
+- 프로토콜 existential 오버헤드
+- withUnsafeMutableBufferPointer 활용
+
+### SVO 알고리즘
+- Octree 구조와 순회
+- DDA (Digital Differential Analyzer)
+- 콘 트레이싱 이론
+- 밉맵과 Level-of-Detail
+
+### 렌더링 기법
+- SVOGI (Sparse Voxel Octree Global Illumination)
+- 레이 마칭 vs 레이 트레이싱
+- PBR (Physically Based Rendering)
+- Beer's law (투명도/흡수)
+
+### 메모리 최적화
+- 캐시 라인과 False Sharing
+- SoA vs AoS 트레이드오프
+- 메모리 정렬과 패딩
+- TLB와 Huge Pages
+
+이것으로 Ikyo ECS 아키텍처의 모든 내용을 쉽게 설명한 가이드를 마칩니다!
