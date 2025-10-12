@@ -55,7 +55,7 @@ public enum VM {
       GetSystemInfo(&si)
       return Int(si.dwAllocationGranularity)
     #else
-      // On POSIX mmap can reserve at page granularity
+      // POSIX에서는 mmap이 페이지 단위로 예약할 수 있음
       return pageSize()
     #endif
   }
@@ -74,21 +74,21 @@ public enum VM {
 
 }
 
-// Reserve address space, optionally aligned to allocation granularity or larger if possible.
-// For simplicity and portability, we guarantee alignment to allocation granularity.
-// For alignments above granularity, we best-effort with over-reserve on POSIX; on Windows we stick to granularity.
+// 주소 공간을 예약하며, 가능하면 할당 단위 또는 그보다 큰 값으로 정렬
+// 간단함과 이식성을 위해 할당 단위로의 정렬을 보장함
+// 할당 단위를 초과하는 정렬의 경우, POSIX에서는 과잉 예약으로 최선을 다하며, Windows에서는 할당 단위를 유지함
 public func vmReserve(size: Int, alignment: Int) throws -> VMRegion {
   precondition(size > 0)
   let pg = VM.pageSize()
   let gran = VM.allocationGranularity()
   let reserveSize = VM.alignUp(size, to: pg)
   #if os(Windows)
-    // Windows: VirtualAlloc aligns to allocation granularity.
+    // Windows: VirtualAlloc은 할당 단위로 정렬함
     let base = VirtualAlloc(nil, reserveSize, DWORD(MEM_RESERVE), DWORD(PAGE_NOACCESS))
     guard let b = base else { throw VMError.reserveFailed }
     return VMRegion(base: b, size: reserveSize, pageSize: pg, reserved: true)
   #else
-    // POSIX: Try to over-reserve to honor alignment if larger than page size.
+    // POSIX: 페이지 크기보다 큰 경우 정렬을 준수하기 위해 과잉 예약 시도
     let al = max(gran, alignment)
     let over = al > pg ? reserveSize + al : reserveSize
     let p = mmap(nil, over, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0)
@@ -98,7 +98,7 @@ public func vmReserve(size: Int, alignment: Int) throws -> VMRegion {
     var base = p!.assumingMemoryBound(to: UInt8.self)
     var finalSize = reserveSize
     if al > pg {
-      // Align base forward to 'al'
+      // base를 'al'로 앞쪽 정렬
       let addr = UInt(bitPattern: base)
       let aligned = VM.alignUp(Int(addr), to: al)
       let pre = aligned - Int(addr)
@@ -118,7 +118,7 @@ public func vmReserve(size: Int, alignment: Int) throws -> VMRegion {
   #endif
 }
 
-// Commit a range within a reserved region: offset and size are page-aligned or will be aligned down/up.
+// 예약된 영역 내에서 범위를 커밋: offset과 size는 페이지 정렬되거나 내림/올림 정렬됨
 @discardableResult
 public func vmCommit(_ region: inout VMRegion, offset: Int, size: Int) throws -> Bool {
   guard let base = region.base else { throw VMError.invalidParameters }
@@ -133,17 +133,17 @@ public func vmCommit(_ region: inout VMRegion, offset: Int, size: Int) throws ->
     return true
   #else
     let p = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: base) + UInt(offA))!
-    // Switch protection to RW to "commit"
+    // "커밋"하기 위해 보호를 RW로 전환
     if mprotect(p, sizeA, PROT_READ | PROT_WRITE) != 0 {
       throw VMError.commitFailed
     }
-    // Optionally touch pages lazily elsewhere
+    // 선택적으로 다른 곳에서 페이지를 지연 접근
     return true
   #endif
 
 }
 
-// Decommit a committed range: set to no access and advise discard if available.
+// 커밋된 범위를 해제: 접근 불가로 설정하고 가능하면 폐기 권고
 public func vmDecommit(_ region: inout VMRegion, offset: Int, size: Int) {
   guard let base = region.base else { return }
   let offA = VM.alignDown(offset, to: region.pageSize)
@@ -152,7 +152,7 @@ public func vmDecommit(_ region: inout VMRegion, offset: Int, size: Int) {
 
   #if os(Windows)
     let p = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: base) + UInt(offA))
-    // MEM_DECOMMIT leaves address space reserved
+    // MEM_DECOMMIT는 주소 공간을 예약된 상태로 유지함
     _ = VirtualFree(p, SIZE_T(sizeA), DWORD(MEM_DECOMMIT))
   #else
     let p = UnsafeMutableRawPointer(bitPattern: UInt(bitPattern: base) + UInt(offA))!
@@ -215,16 +215,16 @@ public func vmRelease(_ region: inout VMRegion) throws {
   region.reserved = false
 }
 
-// Hint for huge pages (best effort).
+// 큰 페이지에 대한 힌트 (최선을 다함)
 public func vmAdviseHuge(_ region: VMRegion, enable: Bool) {
   guard let base = region.base else { return }
   #if os(Windows)
-    // Windows large pages must be allocated with MEM_LARGE_PAGES at reserve-time; cannot switch post-hoc.
+    // Windows 큰 페이지는 예약 시점에 MEM_LARGE_PAGES로 할당되어야 하며, 사후에 전환할 수 없음
     _ = base
     _ = enable
   #else
     #if canImport(Darwin)
-      // macOS does not offer madvise(MADV_HUGEPAGE); transparent huge pages not exposed. Best effort no-op.
+      // macOS는 madvise(MADV_HUGEPAGE)를 제공하지 않음; 투명 큰 페이지가 노출되지 않음. 최선을 다하는 no-op
       _ = base
       _ = enable
     #else

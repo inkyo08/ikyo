@@ -15,18 +15,18 @@ final class GameLoop {
   
   private var window: Window?
 
-  // MARK: - Initialize
+  // MARK: - 초기화
   func initialize() {
     window = Window(w: windowWidth, h: windowHeight, name: "Ikyo")
   }
 
-  // MARK: - Update
+  // MARK: - 업데이트
   func update() {
     while doFrame {
       window?.pollEvents()
     }
   }
 
-  // MARK: - Exit
+  // MARK: - 종료
   func exit() {}
 }

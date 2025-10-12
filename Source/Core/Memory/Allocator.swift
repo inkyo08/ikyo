@@ -7,7 +7,7 @@ public protocol RawAllocator: AnyObject, Sendable {
 
 public enum IkyoAlloc {
   public static let global: RawAllocator = BinnedAllocator.shared
-  // You can switch to LargeAllocator.shared for testing large-only.
+  // 큰 할당만 테스트하려면 LargeAllocator.shared로 전환할 수 있습니다.
 }
 
 #if swift(>=5.9)
@@ -43,7 +43,7 @@ public enum IkyoAlloc {
 
   }
 #else
-  // Fallback for older Swift: class wrapper to avoid accidental copying
+  // 이전 Swift 버전 대체: 실수로 복사하는 것을 방지하기 위한 클래스 래퍼
   public final class EngineBuffer<Element> {
     private var ptr: UnsafeMutableRawPointer
     public let count: Int

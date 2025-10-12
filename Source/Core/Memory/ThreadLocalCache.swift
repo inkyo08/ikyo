@@ -8,19 +8,19 @@ import Foundation
   import Glibc
 #endif
 
-// Thread-local per-class stack of free pointers used by the small allocator fast path.
+// 작은 할당자의 빠른 경로에서 사용되는 클래스별 스레드-로컬 해제 포인터 스택.
 // v2:
-// - Windows switches to FlsAlloc with destructor for automatic cleanup (fallback to TlsAlloc).
-// - POSIX destructor now flushes to allocator then releases.
-// - Dynamic class-count configuration to match allocator classes safely.
-// - Safe resizing of per-thread stacks to avoid OOB when class count grows.
+// - Windows는 자동 정리를 위한 소멸자와 함께 FlsAlloc으로 전환 (TlsAlloc으로 대체).
+// - POSIX 소멸자는 이제 할당자로 플러시한 후 해제.
+// - 할당자 클래스와 안전하게 일치시키기 위한 동적 클래스 수 구성.
+// - 클래스 수가 증가할 때 OOB를 방지하기 위한 스레드별 스택의 안전한 크기 조정.
 public final class TLSMagazine {
   public static let shared = TLSMagazine()
 
   public private(set) var maxClasses: Int
   public private(set) var stackCapacityPerClass: Int
 
-  // Internal per-thread structure
+  // 내부 스레드별 구조체
   final class PerThread {
     var stacks: [[UnsafeMutableRawPointer]]
     init(classes: Int, cap: Int) {
@@ -31,7 +31,7 @@ public final class TLSMagazine {
     }
   }
 
-  // Current configuration (can be widened via configure())
+  // 현재 구성 (configure()를 통해 확장 가능)
   private var classes: Int
   private var cap: Int
 
@@ -43,7 +43,7 @@ public final class TLSMagazine {
     private var tlsKey = pthread_key_t()
   #endif
 
-  // [v2] constructor with safe initial guesses; will be reconfigured by allocator
+  // [v2] 안전한 초기 추측값을 가진 생성자; 할당자에 의해 재구성될 예정
   private init(classes: Int = 80, cap: Int = 32) {
     self.classes = max(1, classes)
     self.cap = max(1, cap)
@@ -51,7 +51,7 @@ public final class TLSMagazine {
     self.stackCapacityPerClass = self.cap
 
     #if os(Windows)
-      // Try FLS (with destructor). If it fails, fall back to TLS.
+      // FLS (소멸자 포함) 시도. 실패 시 TLS로 대체.
       let destructor: @convention(c) (UnsafeMutableRawPointer?) -> Void = { ptr in
         TLSMagazine.flsDestructor(ptr)
       }
@@ -68,7 +68,7 @@ public final class TLSMagazine {
       }
     #else
       let destructor: @convention(c) (UnsafeMutableRawPointer) -> Void = { raw in
-        // POSIX destructor: flush then release
+        // POSIX 소멸자: 플러시한 후 해제
         let unmanaged = Unmanaged<PerThread>.fromOpaque(raw)
         let threadObj = unmanaged.takeUnretainedValue()
         TLSMagazine.shared.flushAllToGlobal(of: threadObj) { idx, batch in
@@ -85,7 +85,7 @@ public final class TLSMagazine {
     #endif
   }
 
-  // [v2] Allow allocator to widen class count and optionally adjust cap
+  // [v2] 할당자가 클래스 수를 확장하고 선택적으로 용량을 조정하도록 허용
   public func configure(maxClasses newClasses: Int, cap newCap: Int? = nil) {
     if newClasses > self.classes {
       self.classes = newClasses
@@ -124,7 +124,7 @@ public final class TLSMagazine {
     #endif
   }
 
-  // [v2] Ensure per-thread stacks can index provided classIndex
+  // [v2] 스레드별 스택이 제공된 classIndex를 인덱싱할 수 있도록 보장
   @inline(__always)
   private func ensureCapacity(_ t: PerThread, for classIndex: Int) {
     if classIndex < t.stacks.count { return }
@@ -139,7 +139,7 @@ public final class TLSMagazine {
     }
   }
 
-  // Fast path pop; returns nil if empty
+  // 빠른 경로 pop; 비어있으면 nil 반환
   public func pop(classIndex: Int) -> UnsafeMutableRawPointer? {
     let t = getThread()
     ensureCapacity(t, for: classIndex)
@@ -151,8 +151,8 @@ public final class TLSMagazine {
     return nil
   }
 
-  // Fast path push; returns overflow batch if full
-  // For simplicity we return at most capacity/2 items to flush
+  // 빠른 경로 push; 가득 차면 오버플로우 배치 반환
+  // 단순화를 위해 최대 capacity/2 항목을 플러시하도록 반환
   public func push(classIndex: Int, ptr: UnsafeMutableRawPointer) -> [UnsafeMutableRawPointer]? {
     let t = getThread()
     ensureCapacity(t, for: classIndex)
@@ -168,7 +168,7 @@ public final class TLSMagazine {
     return overflow
   }
 
-  // Batch pop for refill (not used in v1)
+  // 재충전을 위한 배치 pop (v1에서는 사용 안 함)
   public func tryPopMany(classIndex: Int, max: Int) -> [UnsafeMutableRawPointer] {
     let t = getThread()
     ensureCapacity(t, for: classIndex)
@@ -181,13 +181,13 @@ public final class TLSMagazine {
     return tail
   }
 
-  // Global trim hook for frame boundaries or memory pressure
+  // 프레임 경계 또는 메모리 압력을 위한 전역 트림 훅
   public func flushAllToGlobal(flusher: (Int, [UnsafeMutableRawPointer]) -> Void) {
     let t = getThread()
     flushAllToGlobal(of: t, flusher: flusher)
   }
 
-  // [v2] Flush arbitrary PerThread instance (for destructors)
+  // [v2] 임의의 PerThread 인스턴스 플러시 (소멸자용)
   internal func flushAllToGlobal(of t: PerThread, flusher: (Int, [UnsafeMutableRawPointer]) -> Void)
   {
     let count = t.stacks.count
@@ -200,7 +200,7 @@ public final class TLSMagazine {
     }
   }
 
-  // [v2] Windows FLS destructor entry
+  // [v2] Windows FLS 소멸자 진입점
   #if os(Windows)
     private static func flsDestructor(_ ptr: UnsafeMutableRawPointer?) {
       guard let raw = ptr else { return }

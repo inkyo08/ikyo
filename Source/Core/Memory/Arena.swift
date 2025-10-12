@@ -21,7 +21,7 @@ public final class MonotonicArena {
     let alignedOff = VM.alignUp(offset, to: align)
     let end = alignedOff + bytes
     if end > committed {
-      // Need to commit more
+      // 더 많이 커밋해야 함
       let commitTo = VM.alignUp(end, to: pageSize)
       do {
         _ = try vmCommit(&region, offset: committed, size: commitTo - committed)
@@ -36,7 +36,7 @@ public final class MonotonicArena {
   }
 
   public func reset() {
-    // Poison or leave: we keep reservation and decommit committed pages to reduce RSS.
+    // Poison 또는 유지: 예약을 유지하고 커밋된 페이지를 해제하여 RSS를 줄입니다.
     vmDecommit(&region, offset: 0, size: committed)
     committed = 0
     offset = 0
