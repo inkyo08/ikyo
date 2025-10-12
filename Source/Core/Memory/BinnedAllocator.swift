@@ -178,44 +178,33 @@ public final class BinnedAllocator: RawAllocator {
   }
 
   // 클래스의 전역 freelist에 포인터를 push
+  // [FIX: ABA] growLock으로 보호하여 ABA 문제 방지
   private func pushFree(_ cs: ClassState, _ p: UnsafeMutableRawPointer) {
-    // bin의 첫 번째 머신 워드에 next 저장
+    spinLock(cs.growLock)
+    defer { spinUnlock(cs.growLock) }
+    
     let head = cs.freeHead.load(ordering: .relaxed)
     storeNext(p, next: UnsafeMutableRawPointer(bitPattern: UInt(head)))
-    // CAS 루프
-    var cur = head
-    let newHead = UInt(bitPattern: p)
-    while true {
-      storeNext(p, next: UnsafeMutableRawPointer(bitPattern: UInt(cur)))
-      if cs.freeHead.compareExchange(
-        expected: cur, desired: newHead, ordering: .acquiringAndReleasing
-      ).exchanged {
-        cs.freeCount.wrappingIncrement(ordering: .relaxed)
-        break
-      } else {
-        cur = cs.freeHead.load(ordering: .relaxed)
-      }
-    }
+    cs.freeHead.store(UInt(bitPattern: p), ordering: .relaxed)
+    cs.freeCount.wrappingIncrement(ordering: .relaxed)
   }
 
   // 전역 freelist에서 pop; 비어있으면 nil 반환
-  // [FIX: nil crash] 0 포인터의 강제 언랩을 피하도록 nil 처리 변경
+  // [FIX: ABA] growLock으로 보호하여 ABA 문제 방지
   private func popFree(_ cs: ClassState) -> UnsafeMutableRawPointer? {
-    while true {
-      let head = cs.freeHead.load(ordering: .acquiring)
-      if head == 0 {
-        return nil
-      }
-      let headPtr = UnsafeMutableRawPointer(bitPattern: UInt(head))!
-      let next = loadNext(headPtr)
-      let desired: UInt = next.map { UInt(bitPattern: $0) } ?? 0
-      if cs.freeHead.compareExchange(
-        expected: head, desired: desired, ordering: .acquiringAndReleasing
-      ).exchanged {
-        cs.freeCount.wrappingDecrement(ordering: .relaxed)
-        return headPtr
-      }
+    spinLock(cs.growLock)
+    defer { spinUnlock(cs.growLock) }
+    
+    let head = cs.freeHead.load(ordering: .relaxed)
+    if head == 0 {
+      return nil
     }
+    let headPtr = UnsafeMutableRawPointer(bitPattern: UInt(head))!
+    let next = loadNext(headPtr)
+    let desired: UInt = next.map { UInt(bitPattern: $0) } ?? 0
+    cs.freeHead.store(desired, ordering: .relaxed)
+    cs.freeCount.wrappingDecrement(ordering: .relaxed)
+    return headPtr
   }
 
   @inline(__always)
@@ -461,10 +450,10 @@ public final class BinnedAllocator: RawAllocator {
   public func allocate(size: Int, alignment: Int) -> UnsafeMutableRawPointer? {
     if let idx = classIndex(for: size) {
       let cs = states[idx]
-      // bin의 자연 정렬이 요청을 만족하는지 확인
-      // Bin 크기는 16의 제곱 또는 배수이므로, binSize 자체가 정렬임.
-      let binAlign = cs.binSize >= 16 ? 16 : cs.binSize
-      if alignment > binAlign {
+      // bin의 자연 정렬 = binSize의 최대 2의 거듭제곱 인자
+      // 예: 64B bin -> 64B 정렬, 576B bin -> 64B 정렬 (576 = 64*9)
+      let binPow2Align = 1 << cs.binSize.trailingZeroBitCount
+      if alignment > binPow2Align {
         // Small allocator는 이 정렬을 보장할 수 없음; large 경로 사용
         return LargeAllocator.shared.allocate(size: size, alignment: alignment)
       }
@@ -472,6 +461,7 @@ public final class BinnedAllocator: RawAllocator {
       if let p = TLSMagazine.shared.pop(classIndex: idx) {
         #if DEBUG
           MemoryDebug.checkCanaryOnAlloc(ptr: p, size: cs.binSize)
+          MemoryDebug.tagAlloc(ptr: p, size: cs.binSize)
         #endif
         // [v2] 점유 추적 (선택적)
         markAllocatedIfEnabled(cs, ptr: p)
@@ -481,6 +471,7 @@ public final class BinnedAllocator: RawAllocator {
       if let p = popFree(cs) {
         #if DEBUG
           MemoryDebug.checkCanaryOnAlloc(ptr: p, size: cs.binSize)
+          MemoryDebug.tagAlloc(ptr: p, size: cs.binSize)
         #endif
         markAllocatedIfEnabled(cs, ptr: p)
         return p
@@ -490,6 +481,7 @@ public final class BinnedAllocator: RawAllocator {
         if grow(cs), let p = popFree(cs) {
           #if DEBUG
             MemoryDebug.checkCanaryOnAlloc(ptr: p, size: cs.binSize)
+            MemoryDebug.tagAlloc(ptr: p, size: cs.binSize)
           #endif
           markAllocatedIfEnabled(cs, ptr: p)
           return p
@@ -506,6 +498,11 @@ public final class BinnedAllocator: RawAllocator {
   }
 
   public func deallocate(_ p: UnsafeMutableRawPointer, size: Int) {
+    // [FIX: double-free] DEBUG에서 이중 해제 체크를 먼저 수행
+    #if DEBUG
+      MemoryDebug.checkDoubleFree(ptr: p)
+    #endif
+    
     // [FIX: alignment routing] 먼저, Large 할당 감지 및 해제 (정렬 라우팅된 것 포함)
     if LargeAllocator.shared.maybeDeallocate(p) {
       return
@@ -514,7 +511,6 @@ public final class BinnedAllocator: RawAllocator {
     if let idx = classIndex(for: size) {
       let cs = states[idx]
       #if DEBUG
-        MemoryDebug.checkDoubleFree(ptr: p)
         MemoryDebug.poison(ptr: p, size: cs.binSize)
         if MemoryDebug.quarantinePush(ptr: p, classSize: cs.binSize) {
           // Quarantine됨; 누수 추적을 위해 freed로 태그하고 종료

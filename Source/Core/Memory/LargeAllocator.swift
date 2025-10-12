@@ -80,8 +80,16 @@ public final class LargeAllocator {
       header.pointee = Header(
         base: region.base!, totalSize: total, userSize: size, guardPages: Int8(guardPages),
         offsetFromBase: Int32(Int(userPtrRaw) - Int(baseAddr)), magic: LargeAllocator.headerMagic)
+      
       // 사용자 포인터를 반환합니다
-      return UnsafeMutableRawPointer(bitPattern: userPtrRaw)
+      let userPtr = UnsafeMutableRawPointer(bitPattern: userPtrRaw)!
+      
+      // [FIX: debug] 누수 추적에 추가
+      #if DEBUG
+        MemoryDebug.tagAlloc(ptr: userPtr, size: size)
+      #endif
+      
+      return userPtr
     } catch {
       return nil
     }
@@ -89,6 +97,12 @@ public final class LargeAllocator {
 
   public func deallocate(_ p: UnsafeMutableRawPointer?, size: Int) {
     guard let p else { return }
+    
+    // [FIX: double-free] DEBUG에서 이중 해제 체크
+    #if DEBUG
+      MemoryDebug.checkDoubleFree(ptr: p)
+    #endif
+    
     // 헤더를 읽고 영역을 해제합니다
     let headerPtr = p.advanced(by: -MemoryLayout<Header>.size)
     let h = headerPtr.assumingMemoryBound(to: Header.self).pointee
@@ -107,6 +121,11 @@ public final class LargeAllocator {
     } catch {
       assertionFailure("LargeAllocator: vmRelease failed")
     }
+    
+    // [FIX: debug] 누수 추적에서 제거
+    #if DEBUG
+      MemoryDebug.tagFree(ptr: p)
+    #endif
   }
 
   // maybeDeallocate: 헤더 매직을 확인하여 Large 할당을 감지하려고 시도합니다.
