@@ -1,0 +1,96 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "unix-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang"
+      }
+    },
+    {
+      "name": "release - unix",
+      "inherits": "unix-base",
+      "binaryDir": "${sourceDir}/build/unix/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-Wall -Wextra -O3 -ffast-math -march=native -flto -funroll-loops -DRELEASE"
+      }
+    },
+    {
+      "name": "debug - unix",
+      "inherits": "unix-base",
+      "binaryDir": "${sourceDir}/build/unix/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-Wall -Wextra -DDEBUG -O0 -g"
+      }
+    },
+    {
+      "name": "editor - unix",
+      "inherits": "unix-base",
+      "binaryDir": "${sourceDir}/build/unix/editor",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS": "-Wall -Wextra -O2 -DEDITOR"
+      }
+    },
+    {
+      "name": "win-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl"
+      },
+      "vendor": {
+        "jetbrains.com/clion": {
+          "toolchain": "Visual Studio"
+        }
+      }
+    },
+    {
+      "name": "release - win",
+      "inherits": "win-base",
+      "binaryDir": "${sourceDir}/build/win/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "/W4 /O2 /Oi /Ot /Gy /fp:fast /GL /DRELEASE /utf-8",
+        "CMAKE_EXE_LINKER_FLAGS": "/LTCG"
+      }
+    },
+    {
+      "name": "debug - win",
+      "inherits": "win-base",
+      "binaryDir": "${sourceDir}/build/win/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "/W4 /DDEBUG /Od /Zi /utf-8"
+      }
+    },
+    {
+      "name": "editor - win",
+      "inherits": "win-base",
+      "binaryDir": "${sourceDir}/build/win/editor",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS": "/W4 /O2 /DEDITOR /Zi /utf-8"
+      }
+    }
+  ]
+}
