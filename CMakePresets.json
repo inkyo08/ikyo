@@ -24,7 +24,6 @@
       "inherits": "unix-base",
       "binaryDir": "${sourceDir}/build/unix/release",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_FLAGS": "-Wall -Wextra -O3 -ffast-math -march=native -flto -funroll-loops -DRELEASE"
       }
     },
@@ -33,7 +32,6 @@
       "inherits": "unix-base",
       "binaryDir": "${sourceDir}/build/unix/debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_FLAGS": "-Wall -Wextra -DDEBUG -O0 -g"
       }
     },
@@ -42,7 +40,6 @@
       "inherits": "unix-base",
       "binaryDir": "${sourceDir}/build/unix/editor",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS": "-Wall -Wextra -O2 -DEDITOR"
       }
     },
@@ -69,7 +66,6 @@
       "inherits": "win-base",
       "binaryDir": "${sourceDir}/build/win/release",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_FLAGS": "/W4 /O2 /Oi /Ot /Gy /fp:fast /GL /DRELEASE /utf-8",
         "CMAKE_EXE_LINKER_FLAGS": "/LTCG"
       }
@@ -79,7 +75,6 @@
       "inherits": "win-base",
       "binaryDir": "${sourceDir}/build/win/debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_FLAGS": "/W4 /DDEBUG /Od /Zi /utf-8"
       }
     },
@@ -88,7 +83,6 @@
       "inherits": "win-base",
       "binaryDir": "${sourceDir}/build/win/editor",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_C_FLAGS": "/W4 /O2 /DEDITOR /Zi /utf-8"
       }
     }
