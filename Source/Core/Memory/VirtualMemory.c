@@ -8,6 +8,16 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef NDEBUG
+#  define VM_ASSERT_SUCCESS(expr) expr
+#else
+#  define VM_ASSERT_SUCCESS(expr) \
+do { \
+  int ret = (expr); \
+  assert(ret == 0); \
+} while(0)
+#endif
+
 const static size_t systemPageSize = 4 * 1024;
 
 void VM_Initialize() { assert(systemPageSize == sysconf(_SC_PAGESIZE)); }
@@ -35,13 +45,13 @@ void* VM_Reserve(size_t reserveSize, const size_t alignment)
   const size_t diff = upAlignedAddr - addr;
 
   // mmap으로 할당받은 실제 메모리 주소를 저장하기 위해, 이 저장용 영역은 읽기와 쓰기 권한이 있어야 함
-  mprotect((void*)addr, diff, PROT_READ | PROT_WRITE);
+  VM_ASSERT_SUCCESS(mprotect((void*)addr, diff, PROT_READ | PROT_WRITE));
 
   // Store the address
   size_t* adjustment = ((size_t*)upAlignedAddr) - 1;
   *adjustment = diff;
   // Revert to read only.
-  mprotect((void*)addr, diff, PROT_READ);
+  VM_ASSERT_SUCCESS(mprotect((void*)addr, diff, PROT_READ));
 
   return (void*)upAlignedAddr;
 }
@@ -50,14 +60,14 @@ void VM_Unreserve(void* base, size_t reservedSize, const size_t alignment)
 {
   assert((systemPageSize & (systemPageSize - 1)) == 0);
   reservedSize = (reservedSize + (systemPageSize - 1)) & ~(systemPageSize - 1);
-  if (alignment <= systemPageSize) assert(munmap(base, reservedSize) == 0);
+  if (alignment <= systemPageSize) VM_ASSERT_SUCCESS(munmap(base, reservedSize));
   else
   {
     const size_t paddedReserveSize = reservedSize + alignment;
     const size_t* adjustment = ((size_t*)base) - 1;
     uintptr_t baseAddr = (uintptr_t)base;
     baseAddr -= *adjustment;
-    assert( munmap((void*)baseAddr, paddedReserveSize) == 0);
+    VM_ASSERT_SUCCESS(munmap((void*)baseAddr, paddedReserveSize));
   }
 }
 
@@ -66,7 +76,7 @@ void VM_MapPages(void* base, const size_t size)
   const uintptr_t baseAddr = (uintptr_t)base & ~(systemPageSize - 1);
   assert((systemPageSize & (systemPageSize - 1)) == 0);
   const uintptr_t endAddr = (((uintptr_t)base + size) + (systemPageSize - 1)) & ~(systemPageSize - 1);
-  assert( mprotect((void*)baseAddr, endAddr - baseAddr, PROT_READ | PROT_WRITE) == 0 );
+  VM_ASSERT_SUCCESS(mprotect((void*)baseAddr, endAddr - baseAddr, PROT_READ | PROT_WRITE));
 }
 
 void VM_UnmapPages(void* base, const size_t size)
@@ -74,9 +84,7 @@ void VM_UnmapPages(void* base, const size_t size)
   const uintptr_t baseAddr = (uintptr_t)base & ~(systemPageSize - 1);
   assert((systemPageSize & (systemPageSize - 1)) == 0);
   const uintptr_t endAddr = (((uintptr_t)base + size) + (systemPageSize - 1)) & ~(systemPageSize - 1);
-  assert( mprotect((void*)baseAddr, endAddr - baseAddr, PROT_NONE) == 0 );
+  VM_ASSERT_SUCCESS(mprotect((void*)baseAddr, endAddr - baseAddr, PROT_NONE));
 }
 
 #endif
-
-
