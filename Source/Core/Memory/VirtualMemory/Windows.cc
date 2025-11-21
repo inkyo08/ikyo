@@ -7,6 +7,8 @@
 
 module Memory;
 
+#if _WIN32
+
 template<typename T>
 static inline T Align(T nData, size_t nAlign)
 {
@@ -15,10 +17,9 @@ static inline T Align(T nData, size_t nAlign)
   return T(size);
 }
 
-const size_t systemPageSize = 4 * 1024;
+constexpr size_t systemPageSize = 4 * 1024;
 
 namespace Memory::VirtualMemory {
-#if _WIN32
 
   void* reserve(size_t size, size_t alignment)
   {
@@ -48,5 +49,6 @@ namespace Memory::VirtualMemory {
   void map(void* base, size_t size) { VirtualAlloc(base, size, MEM_COMMIT, PAGE_READWRITE); }
 
   void unmap(void* base, size_t size) { VirtualFree(base, size, MEM_DECOMMIT); }
-#endif
 }
+
+#endif

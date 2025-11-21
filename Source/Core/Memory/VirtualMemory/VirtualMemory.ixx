@@ -1,4 +1,8 @@
-﻿export module Memory:VirtualMemory;
+﻿module;
+
+#include <cstddef>
+
+export module Memory:VirtualMemory;
 
 export namespace Memory::VirtualMemory {
   // size는 시스템 페이지 크기에 맞춰 올림 처리
