@@ -14,7 +14,15 @@ target_include_directories(Sandbox PRIVATE Source)
 file(GLOB_RECURSE IKYO_SOURCES
         "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/*.cc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.cxx"
+)
+
+file(GLOB_RECURSE IKYO_MODULES
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.ixx"
 )
 
 target_sources(Game PRIVATE ${IKYO_SOURCES})
+target_sources(Game PRIVATE FILE_SET CXX_MODULES FILES ${IKYO_MODULES})
 target_sources(Sandbox PRIVATE ${IKYO_SOURCES})
+target_sources(Sandbox PRIVATE FILE_SET CXX_MODULES FILES ${IKYO_MODULES})
