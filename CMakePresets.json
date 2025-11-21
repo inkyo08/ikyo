@@ -1,0 +1,64 @@
+{
+  "version": 10,
+  "configurePresets": [
+    {
+      "name": "unix",
+      "hidden": true,
+      "generator": "Ninja",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "DEBUG - Ninja",
+      "inherits": "unix",
+      "binaryDir": "${sourceDir}/Build/Unix/Debug",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-Wall -Wextra -O0 -g -DDEBUG"
+      }
+    },
+    {
+      "name": "RELEASE - Ninja",
+      "inherits": "unix",
+      "binaryDir": "${sourceDir}/Build/Unix/Release",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-Wall -Wextra -O3 -ffast-math -march=native -mtune=native -flto=full -fno-stack-protector -fomit-frame-pointer -funsafe-math-optimizations -fno-math-errno -funroll-loops -fno-rtti -fno-exceptions -fno-semantic-interposition -fstrict-aliasing -fvectorize -fslp-vectorize -freciprocal-math -fno-plt -fvisibility=hidden -DRELEASE -DNDEBUG"
+      }
+    },
+    {
+      "name": "win",
+      "hidden": true,
+      "generator": "Visual Studio 18 2026",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl"
+      }
+    },
+    {
+      "name": "DEBUG - Windows",
+      "inherits": "win",
+      "binaryDir": "${sourceDir}/Build/Windows/Debug",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/W4 /Od /Zi /utf-8 /DDEBUG"
+      }
+    },
+    {
+      "name": "RELEASE - Windows",
+      "inherits": "win",
+      "binaryDir": "${sourceDir}/Build/Windows/Release",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/W4 /Ox /Oi /Ot /Ob3 /GL /arch:AVX2 /fp:fast /favor:AMD64 /Qpar /Qvec-report:2 /Gy- /GS- /GR- /Gw /Zc:inline /Zc:strictStrings /utf-8 /DRELEASE /DNDEBUG",
+        "CMAKE_EXE_LINKER_FLAGS": "/LTCG"
+      }
+    }
+  ]
+}
