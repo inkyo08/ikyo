@@ -22,9 +22,11 @@ let package = Package(
   products: [
     .executable(name: "Ikyo", targets: ["Game"])
   ],
+  dependencies: [ .package(url: "https://github.com/apple/swift-atomics.git", .upToNextMajor(from: "1.3.0")), ],
   targets: [
     .target(
       name: "Common",
+      dependencies: [ .product(name: "Atomics", package: "swift-atomics") ],
       swiftSettings: swiftSettings
     ),
     .executableTarget(
