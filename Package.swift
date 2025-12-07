@@ -12,7 +12,6 @@ let swiftSettings: [SwiftSetting] = [
     "-Ounchecked",
     "-whole-module-optimization",
     "-enforce-exclusivity=unchecked",
-    "-enable-bare-slash-regex",
     "-cross-module-optimization"
   ], .when(configuration: .release))
 ]
