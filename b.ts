@@ -7,8 +7,6 @@ const project_name = "ikyo"
 const arg1 = Deno.args[0] ?? "config"  // config or build
 const arg2 = Deno.args[1] ?? "debug"   // debug or release
 
-const dirs = ["main"]
-
 const msvc_flag: string[] = []
 const clang_flag = ["-std=c++20", "-Wall", "-Wextra",]
 
@@ -17,6 +15,18 @@ const msvc_release_flag: string[] = []
 
 const clang_debug_flag =   ["-g", "-O0", "-ffast-math", "-DDEBUG"]
 const clang_release_flag = ["-03", "-ffast-math", "-DNDEBUG"]
+
+const dirs: string[] = []
+for await (const entry of Deno.readDir("src")) {
+  if (entry.isDirectory) {
+    try {
+      await Deno.stat(join("src", entry.name, ".b"))
+      dirs.push(entry.name)
+    } catch {
+      // Skip directories without .b files
+    }
+  }
+}
 
 const source_files: string[] = []
 for (const dir of dirs) {
