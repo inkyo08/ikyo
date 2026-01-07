@@ -51,7 +51,7 @@ namespace Ikyo::Foundation::Atomics
 #include <Windows.h>
 #include <intrin.h>
 
-namespace Ikyo::Foundation::Atomics
+namespace Atomics
 {
   template <AtomicsCompatible T>
   inline T load (const volatile T *ptr)
@@ -171,6 +171,6 @@ namespace Ikyo::Foundation::Atomics
     else if constexpr (sizeof (T) == 8)
       return (T) _InterlockedXor64 ((volatile long long *) ptr, (long long) value);
   }
-} /* namespace Ikyo::Foundation::Atomics */
+} /* namespace Atomics */
 
 #endif
