@@ -14,37 +14,37 @@ namespace Atomics {
 namespace Atomics
 {
   template <AtomicsCompatible T>
-  inline T load (const volatile T *ptr) { return __atomic_load_n (ptr, __ATOMIC_SEQ_CST); }
+  T load (const volatile T *ptr) { return __atomic_load_n (ptr, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
-  inline void store (volatile T *ptr, T value) { __atomic_store_n (ptr, value, __ATOMIC_SEQ_CST); }
+  void store (volatile T *ptr, T value) { __atomic_store_n (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
-  inline T exchange (volatile T *ptr, T value) { return __atomic_exchange_n (ptr, value, __ATOMIC_SEQ_CST); }
+  T exchange (volatile T *ptr, T value) { return __atomic_exchange_n (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
-  inline bool compare_exchange (volatile T *ptr, T *expected, T desired)
+  bool compare_exchange (volatile T *ptr, T *expected, T desired)
     { return __atomic_compare_exchange_n (ptr, expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_add (volatile T *ptr, T value) { return __atomic_fetch_add (ptr, value, __ATOMIC_SEQ_CST); }
+  T fetch_add (volatile T *ptr, T value) { return __atomic_fetch_add (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_sub (volatile T *ptr, T value) { return __atomic_fetch_sub (ptr, value, __ATOMIC_SEQ_CST); }
+  T fetch_sub (volatile T *ptr, T value) { return __atomic_fetch_sub (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_or (volatile T *ptr, T value) { return __atomic_fetch_or (ptr, value, __ATOMIC_SEQ_CST); }
+  T fetch_or (volatile T *ptr, T value) { return __atomic_fetch_or (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_and (volatile T *ptr, T value) { return __atomic_fetch_and (ptr, value, __ATOMIC_SEQ_CST); }
+  T fetch_and (volatile T *ptr, T value) { return __atomic_fetch_and (ptr, value, __ATOMIC_SEQ_CST); }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_xor (volatile T *ptr, T value) { return __atomic_fetch_xor (ptr, value, __ATOMIC_SEQ_CST); }
+  T fetch_xor (volatile T *ptr, T value) { return __atomic_fetch_xor (ptr, value, __ATOMIC_SEQ_CST); }
 } /* namespace Atomics */
 
 #elif defined (_WIN32)
@@ -54,7 +54,7 @@ namespace Atomics
 namespace Atomics
 {
   template <AtomicsCompatible T>
-  inline T load (const volatile T *ptr)
+  T load (const volatile T *ptr)
   {
     T value = *ptr;
     _ReadWriteBarrier ();
@@ -62,7 +62,7 @@ namespace Atomics
   }
 
   template <AtomicsCompatible T>
-  inline void store (volatile T *ptr, T value)
+  void store (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 1)
       _InterlockedExchange8 ((volatile char *) ptr, (char) value);
@@ -75,7 +75,7 @@ namespace Atomics
   }
 
   template <AtomicsCompatible T>
-  inline T exchange (volatile T *ptr, T value)
+  T exchange (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 1)
       return (T) _InterlockedExchange8 ((volatile char *) ptr, (char) value);
@@ -88,7 +88,7 @@ namespace Atomics
   }
 
   template <AtomicsCompatible T>
-  inline bool compare_exchange (volatile T *ptr, T *expected, T desired)
+  bool compare_exchange (volatile T *ptr, T *expected, T desired)
   {
     T old;
     if constexpr (sizeof (T) == 1)
@@ -108,7 +108,7 @@ namespace Atomics
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_add (volatile T *ptr, T value)
+  T fetch_add (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 4)
       return (T) _InterlockedExchangeAdd ((volatile long *) ptr, (long) value);
@@ -125,14 +125,14 @@ namespace Atomics
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_sub (volatile T *ptr, T value)
+  T fetch_sub (volatile T *ptr, T value)
   {
     return fetch_add (ptr, -value);
   }
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_or (volatile T *ptr, T value)
+  T fetch_or (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 1)
       return (T) _InterlockedOr8 ((volatile char *) ptr, (char) value);
@@ -146,7 +146,7 @@ namespace Atomics
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_and (volatile T *ptr, T value)
+  T fetch_and (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 1)
       return (T) _InterlockedAnd8 ((volatile char *) ptr, (char) value);
@@ -160,7 +160,7 @@ namespace Atomics
 
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
-  inline T fetch_xor (volatile T *ptr, T value)
+  T fetch_xor (volatile T *ptr, T value)
   {
     if constexpr (sizeof (T) == 1)
       return (T) _InterlockedXor8 ((volatile char *) ptr, (char) value);
