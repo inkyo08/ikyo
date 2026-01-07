@@ -2,16 +2,16 @@
 
 #include <type_traits>
 
-namespace Ikyo::Foundation::Atomics {
+namespace Atomics {
   template <typename T>
   concept AtomicsCompatible = 
     (std::is_integral_v <T> || std::is_pointer_v <T>) &&
     (sizeof (T) == 1 || sizeof (T) == 2 || sizeof (T) == 4 || sizeof (T) == 8);
-} /* namespace Ikyo::Foundation::Atomics */
+} /* namespace ::Atomics */
 
 #if defined (__APPLE__) || defined (__linux__)
 
-namespace Ikyo::Foundation::Atomics
+namespace Atomics
 {
   template <AtomicsCompatible T>
   inline T load (const volatile T *ptr) { return __atomic_load_n (ptr, __ATOMIC_SEQ_CST); }
@@ -45,7 +45,7 @@ namespace Ikyo::Foundation::Atomics
   template <AtomicsCompatible T>
   requires std::is_integral_v <T>
   inline T fetch_xor (volatile T *ptr, T value) { return __atomic_fetch_xor (ptr, value, __ATOMIC_SEQ_CST); }
-} /* namespace Ikyo::Foundation::Atomics */
+} /* namespace Atomics */
 
 #elif defined (_WIN32)
 #include <Windows.h>
