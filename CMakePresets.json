@@ -1,0 +1,49 @@
+{
+  "version": 9,
+  "configurePresets": [
+    {
+      "name": "VS",
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "${sourceDir}/Build/VS",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "Xcode",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/Build/Xcode",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/Build/Ninja",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "VS", "configurePreset": "VS" },
+    { "name": "Xcode", "configurePreset": "Xcode" },
+    { "name": "Ninja", "configurePreset": "Ninja" }
+  ]
+}
