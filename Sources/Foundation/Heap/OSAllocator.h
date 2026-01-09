@@ -93,14 +93,14 @@ inline OSAllocator::~OSAllocator()
   }
 }
 
-inline void OSAllocator::map(size_t size)
+inline void OSAllocator::map(const size_t size)
 {
   const uintptr_t base_addr = reinterpret_cast <uintptr_t> (base) & ~(page_size - 1);
   const uintptr_t end_addr = Detail::align_to (reinterpret_cast <uintptr_t> (base) + size, page_size);
   if (mprotect (reinterpret_cast <void *> (base_addr), end_addr - base_addr, PROT_READ | PROT_WRITE)) abort ();
 }
 
-inline void OSAllocator::unmap(size_t size)
+inline void OSAllocator::unmap(const size_t size)
 {
   const uintptr_t base_addr = reinterpret_cast <uintptr_t> (base) & ~(page_size - 1);
   const uintptr_t end_addr = Detail::align_to (reinterpret_cast <uintptr_t> (base) + size, page_size);
